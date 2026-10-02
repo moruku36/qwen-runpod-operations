@@ -1,0 +1,13 @@
+# Chat-only RunPod runtime (inputs). Resolved + hashed lock: requirements-runpod.lock.txt
+# Mirrors upstream requirements-chat-colab.txt @ 9e5ff82c (requirements.txt inlined). torch/CUDA come from the Pod image.
+gradio>=6.0,<7
+pillow>=10
+requests>=2.31
+numpy>=1.26
+ddgs>=9
+pypdfium2==4.30.0
+huggingface_hub>=1.0
+faster-whisper>=1,<2
+ipywidgets>=8,<9
+# Pod-side checks; not needed to serve the app
+pytest>=8

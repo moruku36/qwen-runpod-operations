@@ -35,6 +35,7 @@ RunPod を試す価値はある。まずは **Secure Cloud の On-Demand A100 80
 3. [起動前から終了までのチェックリスト](docs/session-checklist.ja.md)
 4. [測定結果の記録用テンプレート](docs/experiment-template.ja.md)
 5. [確認した一次資料](docs/sources.ja.md)
+6. [RunPod実行手順書（実装版）](docs/runpod-runbook.ja.md)
 
 `baseline.json` は今回確認したソースとモデルの識別情報。モデル本体、秘密情報、会話履歴、Notebook出力はこのリポジトリに置かない。
 
