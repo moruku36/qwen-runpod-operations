@@ -51,6 +51,33 @@
     "Publisher metadata is not a local download verification.",
     "File change commits are source-page references; implementation must pin and validate an appropriate immutable revision.",
     "Template digest and dependency lock remain unset until implementation.",
-    "No billing, deployment, automatic stop or termination is authorized by this file."
-  ]
+    "No billing, deployment, automatic stop or termination is authorized by this file.",
+    "The default is disposable Pod Volume storage, not seven-day Network Volume retention.",
+    "A new experiment requires a new plan; repeated fresh setup can cost more than short-term retention.",
+    "No account-wide deletion; existing/shared resources and externally saved reports are excluded."
+  ],
+  "experiment_lifecycle": {
+    "policy": "new_plan_then_experiment_then_verified_external_report_then_delete_experiment_resources",
+    "next_experiment_requires_new_plan": true,
+    "default_gpu": "A100 80GB",
+    "max_session_hours": 2,
+    "default_storage": {
+      "pod_volume_gb": 80,
+      "container_disk_gb": 20,
+      "network_volume_gb": 0,
+      "retain_between_experiments": false
+    },
+    "estimated_two_hour_cost_usd_excluding_tax": 3.21,
+    "total_budget_preference_usd_approximate": 10,
+    "spending_approved": false,
+    "deposit_approved": false,
+    "automatic_hard_budget_cap": false,
+    "resources_created": false,
+    "external_export_and_readback_required_before_deletion": true,
+    "reproduction_metadata_required": true,
+    "deletion_scope": "only_resources_created_for_the_specific_experiment",
+    "irreversible_deletion_requires_action_time_exact_target_confirmation": true,
+    "execution_or_deletion_authorized_by_plan": false,
+    "include_fresh_boot_download_build_export_time_in_each_trial": true
+  }
 }
