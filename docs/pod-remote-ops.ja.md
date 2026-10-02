@@ -1,21 +1,29 @@
-# ClaudeがPod内を扱う接続方法（整理。未設定・未変更）
+# ClaudeがPod内を扱う接続方法
 
-目的: あなたがコマンドやログを仲介せず、ClaudeがPod内の実行・診断・成果の回収を行えるようにする。**このリポジトリでもあなたの環境でも、認証・権限・ネットワーク設定は何も変更していない。** 以下の選択肢は、承認があるまで使わない。
+[English](pod-remote-ops.en.md) | 日本語
 
-## 前提（確認済み）
+最終状態: [2026-10-02 試行報告](trial-report-2026-10-02.ja.md)
 
-- ClaudeがPodに対して使えるのは、REST v2（`api.runpod.io`）だけ。認証は環境側が付与し、Claudeはキーを見ない。現在のキーはPodsの作成・取得・stop・一覧・**ログの読み取り**まで通った。
+**実装のmainへの統合について:** 試行後に実装（スクリプト・Notebook・依存lock・テスト）をmainへ統合した（[README](../README.ja.md)と[実装ガイド](implementation-guide.ja.md)を参照）。以下のコマンドは[固定実装コミット](https://github.com/moruku36/qwen-runpod-operations/tree/69795d54490ffaeff62f18ca80f6181ea674bc16) `69795d54490ffaeff62f18ca80f6181ea674bc16` から実行したもの。Podでの実行を再現するときは、ブランチ先端ではなくそのコミットをcheckoutする。文書の公開は、新しい有料実行・再起動・Terminate・削除の承認ではない。次回は新しい計画と承認が必要。
+
+**2026-10-02の最終状態:** 有料試行では2台のPodを使用。`US-MD-1` では外向き接続に失敗し、`EUR-IS-1` では `selftest`・`net`・`venv` とログ経由の小さな成果物の回収に成功した。CUDAビルド・モデル本体の取得とハッシュ検証・モデルロード・推論は未実施。最終実行報告では両Podが `EXITED`。各Podの停止時にコンソールのCompute・Container storageが `Not running` と確認され、16:05頃（JST）の最終共有画面は第2Podのみを示す。80GBのVolumeは各約$0.022/時で残り、2つで約$1.07/日の保管費が続く。後片付けは保留で、削除は未承認。
+
+目的: 人がコマンドやログを仲介する負担を減らし、ClaudeがPod内の進捗・診断結果・成果を受け取れるようにする。**今回の文書公開では、認証・権限・ネットワーク設定を変更していない。** 案Aは2026-10-02の承認済み試行で検証済み。案B・Cは設定しておらず、新しい権限や接続方法は必要な承認があるまで使わない。
+
+## 試行時の環境と確認事項
+
+- ClaudeがPodに対して使えるのは、REST v2（`api.runpod.io`）だけ。認証は環境側が付与し、Claudeはキーを見ない。試行時の認証ではPodsの作成・取得・stop・一覧・**ログの読み取り**まで成功した。
 - Claudeの環境は外向きHTTPSのプロキシ経由。許可リストにないホスト（例: `docs.runpod.io`、`huggingface.co`）は拒否される。Podへの直接のTCP接続（SSH等）は想定できない。
-- `GET /v2/pods/{id}/logs` は `source=container|system` を選べる読み取りAPI（SSE）。停止中のPodにもシステム行（作成・停止）は残る。コンテナ側の行は、今回のPodでは空だった。
+- `GET /v2/pods/{id}/logs` は `source=container|system` を選べる読み取りAPI（SSE）。停止中のPodにもシステム行（作成・停止）は残る。初回の通常のコンテナコマンド出力は空だったが、後の案Aの試験ではPID 1の標準出力へ書いた行を受信できた。
 
 ## 案A（推奨・新しい権限なし）: ログ経由の連絡路
 
-Pod内の実行スクリプト（`scripts/pod_run.py`）が、短い状態行（`QMC|時刻|段階|内容`）と、小さな成果物（SHA256付きのbase64チャンク）を、Podの標準出力（PID 1）へ書く。ClaudeはREST v2の**ログ読み取りだけ**でそれを受け取る（`scripts/read_pod_logs.py <pod_id>`）。
+Pod内の実行スクリプト（[`scripts/pod_run.py`](https://github.com/moruku36/qwen-runpod-operations/blob/69795d54490ffaeff62f18ca80f6181ea674bc16/scripts/pod_run.py)）が、短い状態行（`QMC|time|stage|content`）と、小さな成果物（SHA256付きのbase64チャンク）を、Podの標準出力（PID 1）へ書く。ClaudeはREST v2の**ログ読み取りだけ**でそれを受け取る（`scripts/read_pod_logs.py <pod_id>`）。
 
 - できること: 進捗・失敗・接続確認の結果の把握、レポート（許可リスト済みの `.tar.gz`）の回収。受け取った成果物はSHA256と許可リストで検証される。
 - できないこと: Claudeが任意のコマンドを実行・診断すること。起動のきっかけ（Jupyterのターミナルへ `python3 scripts/pod_run.py all --bg` を1行貼る）は人が行う。
 - 必要な権限: 現在のキー（Pods読み取り）で足りる。**追加の権限・ネットワーク設定は不要。**
-- **未検証:** 「PID 1の標準出力への書き込みが、コンテナログとしてAPIから見えるか」は、実Podでまだ試していない。次のPodで、起動直後に `python3 scripts/pod_run.py selftest` を実行し、Claudeが `read_pod_logs.py` で `hello from the pod` と `selftest.txt` を受け取れるかを最初に確認する。見えなければ案Bへ進む。
+- **実Podで検証済み（2026-10-02、EUR-IS-1）:** `python3 scripts/pod_run.py selftest` により、PID 1の標準出力へ書いた `hello from the pod` と `selftest.txt` をlogs API経由で受信し、復元ファイルのSHA256一致を確認した。`net`・`venv` の進捗も取得できた。ただし本番推論レポートの回収は未実施。将来の承認済み実行でも、起動直後にこの自己テストを行う。見えなければ診断し、案Bを使うには別途必要な承認を得る。
 - 開発環境では、ログ行のエンコード・復元・改ざん検出、`trial --mock` の成果物を連絡路から取り出す流れまで、テストで確認済み。
 
 ## 案B（ClaudeがPod内で実行）: JupyterのAPI（RunPodのHTTPSプロキシ経由）
@@ -42,9 +50,19 @@ Pod内の実行スクリプト（`scripts/pod_run.py`）が、短い状態行（
 | Claude環境のネットワーク許可 | 不要（`api.runpod.io` は許可済み） | `*.proxy.runpod.net` が必要 | 生TCPが必要（現実的でない） |
 | 環境のシークレット | 不要 | Jupyterのパスワード | 秘密鍵 |
 | 人が行う操作 | Jupyterに1行貼る | 接続情報の設定のみ | 多い |
-| 状態 | 未検証（次のPodで `selftest`） | 未検証 | 非推奨 |
+| 状態 | 実Podで `selftest`・ログ・小さな成果物の回収を検証済み | 未検証・未設定 | 非推奨・未設定 |
 
-## 推奨手順
+## 次回の承認済み試行の推奨手順
 
-1. 次のPodで、まず案Aの `selftest` で連絡路を確認する（最初の1分）。通れば、そのまま `net` → `all` → `trial` を進め、Claudeが `read_pod_logs.py` で状況と成果物を受け取る。
-2. 通らない、または任意のコマンドでの診断が必要になった場合に限り、案Bの設定（上の1〜3）を、あなたの判断で行う。
+1. まず保存中Volumeの後片付け方針と、新しい試行の費用・停止目標・回収先を決める。現在の停止済みPodを再開する場合も、新しい計画と必要な承認を得る
+2. 案Aの `selftest` で連絡路を再確認する（最初の1分を目安）。通れば `net` を実行する。`all` → `trial` はCUDAビルド・モデル本体取得・推論を含む未検証の後続工程なので、その作業範囲と費用の承認後に進める。Claudeは `read_pod_logs.py` で状況と成果物を受け取る
+3. 案Aが通らない、または任意のコマンドによる診断が必要な場合だけ、案Bのネットワーク・認証・WebSocketの条件を確認し、設定変更や認証情報の受け渡しに必要な承認を得る
+
+案Aは一方向のログ・成果物回収経路であり、任意のコマンドを遠隔実行できる接続ではない。長い導入中はログのthrottleにより進捗行が間引かれる場合がある。
+
+## 固定実装へのリンク
+
+以下のファイルは実装の統合後は `main` にも含まれる。試行を正確に再現するときは、ブランチ先端ではなく、上記の固定コミットをcheckoutしてからコマンドを実行する。
+
+- [`scripts/pod_run.py`](https://github.com/moruku36/qwen-runpod-operations/blob/69795d54490ffaeff62f18ca80f6181ea674bc16/scripts/pod_run.py)
+- [`scripts/read_pod_logs.py`](https://github.com/moruku36/qwen-runpod-operations/blob/69795d54490ffaeff62f18ca80f6181ea674bc16/scripts/read_pod_logs.py)
