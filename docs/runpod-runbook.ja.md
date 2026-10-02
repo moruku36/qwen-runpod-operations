@@ -19,12 +19,23 @@
 ## Podへのコード配置（リポジトリはPublic）
 
 1. 人がRunPodコンソールの **Connect** からJupyterに入る。パスワードなどはチャットに出さない。
-2. Jupyterのターミナルで、報告された**コミットSHA**を指定して固定してcloneする（ブランチ名は使わない）。
+2. Jupyterのターミナルで、報告された**コミットSHA**を指定して固定してcloneする（ブランチ名は使わない）。**1行ずつ実行し、各行の結果を確認してから次へ進む**（`&&` でつながない）。
    ```
    git clone https://github.com/moruku36/qwen-runpod-operations /workspace/qwen/ops
-   cd /workspace/qwen/ops && git checkout --detach <40桁のSHA> && test "$(git rev-parse HEAD)" = "<40桁のSHA>" && git status --porcelain
    ```
-   最後のコマンドが何も出力しなければ、作業ツリーはコミットと完全一致。同じ検証は `scripts/pod-bootstrap.sh <SHA>` でも行える。
+   ```
+   cd /workspace/qwen/ops
+   ```
+   ```
+   git checkout --detach <40桁のSHA>
+   ```
+   ```
+   git rev-parse HEAD
+   ```
+   ```
+   git status --porcelain
+   ```
+   `git rev-parse HEAD` が指定したSHAと完全に同じで、`git status --porcelain` が何も出力しなければ、作業ツリーはコミットと完全一致。同じ検証は `bash scripts/pod-bootstrap.sh <SHA>` でも行える（clone後に実行）。
 3. `notebooks/Qwen-Q8-Chat-RunPod.ipynb` を開く。`notebooks/` フォルダからでもリポジトリルートからでも、Cell 1 が正しいルートを解決する（見つからなければ明示的に停止。`QMC_REPO_ROOT` で指定も可）。
 
 ## Notebookの実行順

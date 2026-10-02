@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run in the Pod's Jupyter terminal. Clones this (public) repo and checks out ONE verified commit.
 #   bash pod-bootstrap.sh <40-hex commit>
-# If this script is not on the Pod yet, use the equivalent one-liner from docs/runpod-runbook.ja.md.
+# If this script is not on the Pod yet, run the separate steps listed in docs/runpod-runbook.ja.md one at a time.
 set -euo pipefail
 sha="${1:-}"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "usage: $0 <full 40-hex commit sha>" >&2; exit 2; }
