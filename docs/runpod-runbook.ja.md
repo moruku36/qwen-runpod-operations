@@ -38,17 +38,34 @@
    `git rev-parse HEAD` が指定したSHAと完全に同じで、`git status --porcelain` が何も出力しなければ、作業ツリーはコミットと完全一致。同じ検証は `bash scripts/pod-bootstrap.sh <SHA>` でも行える（clone後に実行）。
 3. `notebooks/Qwen-Q8-Chat-RunPod.ipynb` を開く。`notebooks/` フォルダからでもリポジトリルートからでも、Cell 1 が正しいルートを解決する（見つからなければ明示的に停止。`QMC_REPO_ROOT` で指定も可）。
 
-## Notebookの実行順
+## Pod上の手順（独立したPython環境。システムPythonには入れない）
 
-- Cell 1: ルート解決、実行コミットとクリーン確認、上流を固定SHAで取得、ロックから依存導入と `pip check`
-- Cell 2: 非秘密の環境、llama-serverのビルド（時間を記録）、モデル取得とSHA256照合
-- Cell 3: ログイン値をgetpassで入力して起動。未認証アクセスが拒否されることを確認
-- **Cell 4: 短い応答を1件だけ**。出力上限は64トークン（明示）。モデル起動時間は別に記録。これは動作確認で、性能の測定ではない
-- Cell 4b（任意）: Cell 4の成功後に人が判断したときだけ。warm 10件（出力上限256）。coldとwarmは分けて記録
-- Cell 5: 許可リストのレポートと `.tar.gz`
-- Cell 6: アプリの停止（Podは止まらない）
+システムPython（`/usr/bin/python`）にはOSのパッケージ（例: PyGObject→pycairo）が入っており、そこへ入れて `pip check` すると、このプロジェクトと無関係な理由で失敗する。そのため、依存は `/workspace/qwen/venv` の独立venvに入れる。**1行ずつ実行する。**
 
-性能基準（warm・短文・検索Off・thinkingOffの10試行で、初回tokenの中央値5秒以内、256トークン完了の中央値30秒以内）は**提案基準**で、保証ではない。warm 10件が正常に揃わない限り `perf_criteria` は `skipped` のまま。最初の1件（cold）は基準の評価に使わない。
+```
+python3 scripts/pod_run.py selftest
+```
+ログ経由の連絡路の確認（`docs/pod-remote-ops.ja.md`）。
+```
+python3 scripts/pod_run.py net
+```
+GitHub・PyPI・固定モデル2つの配信先を確認する。**失敗したらその場でStop。**
+```
+python3 scripts/pod_run.py all --bg
+```
+`net` → `source`（上流を固定SHAで取得）→ `venv`（独立venv、ハッシュ付き導入、venv内だけで `pip check`、kernel登録）→ `build`（llama-serverのCUDAビルドとモデルの取得・SHA256照合）を順に実行し、最初の失敗で止まる。時間制限はなく、すぐに戻る。
+```
+python3 scripts/pod_run.py status
+```
+進捗・チェック・ログの末尾。
+```
+python3 scripts/pod_run.py trial
+```
+`build` が成功した後に実行する。UIを起動し（ログイン値は `/workspace/qwen/secrets/gradio-login.txt`、画面には出さない）、**64トークン上限の応答を1件だけ**行い、レポートと `.tar.gz` を作ってログ経由でも送る。`--warm` でwarm 10件（任意）、`--hold-min N` でUIをN分維持。
+
+Notebook（`notebooks/Qwen-Q8-Chat-RunPod.ipynb`）を使う場合は、`venv` の後にkernel「Python (qwen-venv)」を選ぶ。Cell 1 はそのkernelでなければ止まる。性能基準の扱い（提案基準、warm 10件が揃うまで `perf_criteria` は `skipped`、最初の1件は評価に使わない）は変わらない。
+
+CPUでは、mockで `selftest`、`source`、`venv`（実際のpip導入、約39秒）、`trial --mock`（UI・認証・応答・レポート・ログ経由の取り出し）まで通した。**Pod上のCUDAビルド・モデル取得・推論は未検証。**
 
 ## 作成（有料。承認後だけ）
 

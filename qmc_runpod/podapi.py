@@ -9,6 +9,7 @@ Only allowlisted fields of API responses are ever returned or logged.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import secrets
 import time
@@ -156,6 +157,32 @@ class PodApi:
         gpu = body.get("gpu") or {}
         out["gpu_id"], out["gpu_count"] = gpu.get("id"), gpu.get("count")
         return out
+
+    def read_logs(self, pod_id: str, *, tail: int = 500, source: str | None = None, wait_s: float = 8.0) -> list[dict]:
+        """Read-only: backfill up to ``tail`` log events, then stop after ``wait_s`` seconds (the stream never closes).
+        Returns [{"source", "line", "ts"}]. The caller decides what to display; raw lines are not echoed here."""
+        _check_id(pod_id)
+        params = {"tail": min(max(tail, 0), 5000), **({"source": source} if source else {})}
+        events: list[dict] = []
+        try:
+            r = self.s.request("GET", f"{self.base}/pods/{pod_id}/logs", params=params, stream=True,
+                               timeout=(5, wait_s))
+            if r.status_code != 200:
+                raise PodApiError(f"GET logs: HTTP {r.status_code}")
+            deadline = time.monotonic() + wait_s
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw and raw.startswith("data:"):
+                    try:
+                        events.append(json.loads(raw[5:].strip()))
+                    except ValueError:
+                        pass
+                if time.monotonic() > deadline:
+                    break
+        except PodApiError:
+            raise
+        except Exception:  # noqa: BLE001, S110 - a read timeout just means the backfill is finished
+            pass
+        return events
 
     # ---- paid action (guarded)
     def create_pod(self, body: dict, *, approval: str, estimate: dict, limit_usd: float = 10.0) -> dict:

@@ -9,5 +9,7 @@ pypdfium2==4.30.0
 huggingface_hub>=1.0
 faster-whisper>=1,<2
 ipywidgets>=8,<9
+# Notebook kernel inside the isolated venv (registered as 'qwen-venv')
+ipykernel>=6,<8
 # Pod-side checks; not needed to serve the app
 pytest>=8

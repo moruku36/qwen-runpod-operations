@@ -485,7 +485,8 @@ def test_notebook_is_valid_and_secret_free():
         assert "/content" not in src and "google.colab" not in src and "drive.mount" not in src and "RUNPOD_API_KEY" not in src
     text = json.dumps(nb)
     assert "getpass" in text and "launch.launch" in text and "git pull" not in text
-    assert "--require-hashes" in text
+    assert "pip\", \"install" not in text and "pip install" not in text.replace("NOT here: installing into the Pod's system Python", "")
+    assert "running_in_venv" in text and "qwen-venv" in text
 
 
 def test_lock_file_is_hashed_and_pins_gradio():

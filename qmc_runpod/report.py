@@ -155,7 +155,11 @@ def make_bundle(files: list[Path], out_tar: Path) -> dict:
 def verify_bundle(tar_path: Path) -> list[str]:
     """Read-back check done after the bundle is stored outside the Pod. Returns a list of problems."""
     problems: list[str] = []
-    with tarfile.open(tar_path, "r:gz") as tar:
+    try:
+        tar = tarfile.open(tar_path, "r:gz")  # noqa: SIM115 - closed below
+    except (tarfile.ReadError, OSError):
+        return ["not a readable tar.gz"]
+    with tar:
         names = {m.name for m in tar.getmembers()}
         if "MANIFEST.json" not in names:
             return ["MANIFEST.json missing"]
