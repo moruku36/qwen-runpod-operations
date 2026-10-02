@@ -272,7 +272,11 @@ def test_create_body_matches_plan():
         podapi.build_create_body(name="my-pod", gpu_id="g")  # names must be the unique, searchable kind
 
 
-def test_trial_names_are_unique_and_match_pattern():
+def test_trial_names_preserve_distinct_nonces_and_match_pattern(monkeypatch):
+    # A short random nonce can collide. Test naming behavior deterministically,
+    # rather than incorrectly treating 50 random draws as a uniqueness guarantee.
+    nonces=iter(f"{i:04x}" for i in range(50))
+    monkeypatch.setattr(podapi.secrets,"token_hex",lambda n:next(nonces))
     names = {podapi.make_trial_name() for _ in range(50)}
     assert len(names) == 50 and all(podapi.NAME_RE.match(n) for n in names)
 

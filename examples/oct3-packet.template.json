@@ -5,6 +5,7 @@
   "stages": ["selftest", "net", "source", "venv", "build", "trial"],
   "allocated_at": "REPLACE-ACTUAL-ALLOCATION-TIME-WITH-OFFSET",
   "test_deadline": "REPLACE-EARLIER-OF-BUDGET-DEADLINE-OR-T-PLUS-100-MIN",
+  "export_deadline": "REPLACE-EXPORT-END-BY-T-PLUS-110-MIN-AT-LEAST-30-SECONDS-AFTER-TEST-DEADLINE",
   "stop_deadline": "REPLACE-VERIFY-STOP-BY-EARLIER-OF-BUDGET-OR-T-PLUS-120-MIN",
   "approval_date": "2026-10-03",
   "cap_usd": 10,

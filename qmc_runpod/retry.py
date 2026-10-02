@@ -36,7 +36,7 @@ def instant(value: str) -> dt.datetime:
 
 def validate_packet(p: dict, repo: Path, *, now: dt.datetime | None = None) -> None:
     """Validate an explicit immutable packet; no default budget or start time."""
-    required = {"run_id", "commit", "root", "stages", "allocated_at", "test_deadline", "stop_deadline",
+    required = {"run_id", "commit", "root", "stages", "allocated_at", "test_deadline", "export_deadline", "stop_deadline",
                 "approval_date", "cap_usd", "quote_total_usd", "export_destination", "lock_sha256", "feature_options"}
     if set(p) != required:
         raise ValueError("packet keys differ from required schema")
@@ -48,10 +48,12 @@ def validate_packet(p: dict, repo: Path, *, now: dt.datetime | None = None) -> N
             raise ValueError("invalid cost")
     if p["cap_usd"] > 10 or p["quote_total_usd"] > p["cap_usd"]:
         raise ValueError("quote exceeds approved cap")
-    start, tests, stop = (instant(p[k]) for k in ("allocated_at", "test_deadline", "stop_deadline"))
+    start, tests, export, stop = (instant(p[k]) for k in ("allocated_at", "test_deadline", "export_deadline", "stop_deadline"))
     if start.astimezone(dt.timezone(dt.timedelta(hours=9))).date().isoformat() != APPROVED_DAY:
         raise ValueError("allocation date outside approval")
-    if not start < tests < stop or (stop - start).total_seconds() > 7200:
+    if (not start < tests < export < stop or (stop-start).total_seconds() > 7200
+            or (tests-start).total_seconds() > 6000 or (export-start).total_seconds() > 6600
+            or (export-tests).total_seconds() < 30):
         raise ValueError("invalid deadlines or session longer than 120 minutes")
     if now is not None and not start <= now < tests:
         raise ValueError("execution outside allocation/test window")
@@ -76,12 +78,60 @@ def validate_packet(p: dict, repo: Path, *, now: dt.datetime | None = None) -> N
         raise ValueError("requires exact clean execution commit")
 
 
-def terminate_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
+def _live_group(proc: subprocess.Popen) -> bool:
+    """Linux session IDs stay reserved while stragglers exist; reject a reused leader PID."""
+    proc.poll()  # reap our leader, but do not confuse its exit with child cleanup
+    if sys.platform.startswith("linux"):
+        live = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                tail = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(tail[2]) != proc.pid or int(tail[3]) != proc.pid:
+                    continue
+                if entry.name == str(proc.pid) and getattr(proc, "_qmc_start", None) != tail[19]:
+                    return False  # PID reused; never signal this unrelated group
+                if tail[0] != "Z":
+                    live = True
+            except (OSError, ValueError, IndexError):
+                continue
+        return live
+    try:
+        os.killpg(proc.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def terminate_tree(proc: subprocess.Popen, *, grace_seconds: float = 3) -> None:
     if os.name == "posix":
-        os.killpg(proc.pid, signal.SIGTERM)
+        if not getattr(proc, "_qmc_owned_session", False):
+            raise ValueError("refuse to signal a group not created by this controller")
+        def send(sig):
+            if not _live_group(proc):
+                return False
+            try:
+                os.killpg(proc.pid, sig)
+                return True
+            except ProcessLookupError:
+                return False
+        if send(signal.SIGTERM):
+            end = time.monotonic() + max(0, min(grace_seconds, 30))
+            while _live_group(proc) and time.monotonic() < end:
+                time.sleep(.05)
+            killed = send(signal.SIGKILL)  # includes TERM-ignoring children after the leader exits
+            if killed:
+                end = time.monotonic() + 2
+                while _live_group(proc) and time.monotonic() < end:
+                    time.sleep(.05)
+                if _live_group(proc):
+                    raise RuntimeError("owned process group still live after bounded cleanup")
+        proc.wait(timeout=3)
+        return
     else:
+        if proc.poll() is not None:
+            return
         # A Windows venv launcher may have a Python child holding the log handle.
         # Kill only the process tree rooted at the PID this controller just started.
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
@@ -90,30 +140,33 @@ def terminate_tree(proc: subprocess.Popen) -> None:
     try:
         proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
+        proc.kill()
         proc.wait(timeout=3)
 
 
-def bounded_command(cmd: list[str], *, seconds: float, cancel_file: Path, output: Path) -> int:
+def bounded_command(cmd: list[str], *, seconds: float, cancel_file: Path, output: Path, grace_seconds: float = 3) -> int:
     """Bound silent commands too; Linux process groups cancel pip/build/server children."""
     if seconds <= 0 or cancel_file.exists():
         return 124
     with output.open("a", encoding="utf-8") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
                                 start_new_session=os.name == "posix")
+        proc._qmc_owned_session = os.name == "posix"
+        if sys.platform.startswith("linux"):
+            try:
+                proc._qmc_start = Path(f"/proc/{proc.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            except (OSError, IndexError):
+                proc._qmc_start = None
         end = time.monotonic() + seconds
         try:
             while proc.poll() is None:
                 if cancel_file.exists() or time.monotonic() >= end:
-                    terminate_tree(proc)
+                    terminate_tree(proc, grace_seconds=min(grace_seconds, max(0, end-time.monotonic())))
                     return 124
                 time.sleep(min(0.1, max(0, end - time.monotonic())))
             return proc.returncode
         finally:
-            terminate_tree(proc)
+            terminate_tree(proc, grace_seconds=grace_seconds)
 
 
 def execute(p: dict, repo: Path, *, clock=None, command=None) -> int:
@@ -132,6 +185,10 @@ def execute(p: dict, repo: Path, *, clock=None, command=None) -> int:
         state = json.loads(checkpoint.read_text(encoding="utf-8"))
         if state.get("packet_sha256") != packet_hash or state.get("run_id") != p["run_id"]:
             raise ValueError("checkpoint belongs to a different packet/run")
+        if state.get("state") in ("failed", "cancelled"):
+            raise ValueError("failed/cancelled run is terminal; use a fresh run ID and root")
+        if state.get("state") == "running" and state.get("current_stage") == "trial" and "trial" not in state.get("completed", []):
+            raise ValueError("interrupted or in-flight trial is terminal; use a fresh run ID and root")
     else:
         if root.exists() and any(root.iterdir()):
             raise ValueError("fresh root required; stale workspace state cannot be reused")
@@ -153,14 +210,23 @@ def execute(p: dict, repo: Path, *, clock=None, command=None) -> int:
             expected = "selftest.txt=" + digest(root / "runs" / "selftest.txt")
             if receipt.get("run_id") != p["run_id"] or receipt.get("verified") is not True or expected not in receipt.get("expected_files", []) or "selftest:hello from the pod" not in receipt.get("expected_events", []):
                 raise ValueError("selftest receipt lacks exact run/event/file hash")
-        left = (instant(p["test_deadline"]) - clock()).total_seconds()
+        left = (instant(p["export_deadline"] if stage == "trial" else p["test_deadline"]) - clock()).total_seconds()
+        if clock() >= instant(p["test_deadline"]):
+            state.update(state="cancelled", exit_code=124); save(); return 124
         cmd = [sys.executable, str(repo / "scripts/pod_run.py"), stage, "--root", str(root), "--run-id", p["run_id"]]
         if stage == "trial":
             f = p["feature_options"]
             cmd += ["--warm", "--features", "--hold-min", "2", "--allow-public-search", "--audio", f["audio"],
                     "--transcript-file", f["transcript_file"], "--test-deadline", str(instant(p["test_deadline"]).timestamp())]
         state.update(state="running", current_stage=stage); save()
-        rc = command(cmd, seconds=left, cancel_file=root / "CANCEL", output=root / "bootstrap.log")
+        try:
+            rc = command(cmd, seconds=left, cancel_file=root / "CANCEL", output=root / "bootstrap.log",
+                         grace_seconds=min(30, max(0, left)) if stage == "trial" else 3)
+        except BaseException as exc:
+            state.update(state="cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+                         exit_code=1, error_type=type(exc).__name__)
+            save()
+            raise
         if rc != 0:
             state.update(state="cancelled" if rc == 124 else "failed", exit_code=rc,
                          action="external operator must Stop exact Pod; application exit does not stop billing")

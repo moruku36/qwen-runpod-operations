@@ -30,7 +30,7 @@ def main():
     mirror=out/"mirror.log"
     p={"run_id":run_id,"commit":subprocess.check_output(["git","-C",str(REPO),"rev-parse","HEAD"],text=True).strip(),
        "root":str(out/"fake-pod"),"stages":list(retry.STAGES),"allocated_at":"2026-10-03T01:00:00+00:00",
-       "test_deadline":"2026-10-03T02:40:00+00:00","stop_deadline":"2026-10-03T03:00:00+00:00",
+       "test_deadline":"2026-10-03T02:40:00+00:00","export_deadline":"2026-10-03T02:50:00+00:00","stop_deadline":"2026-10-03T03:00:00+00:00",
        "approval_date":"2026-10-03","cap_usd":10,"quote_total_usd":4.49,"export_destination":str(out/"off-pod"),
        "lock_sha256":retry.digest(REPO/"requirements-runpod.lock.txt"),
        "feature_options":{"allow_public_search":True,"audio":str(audio),"audio_sha256":retry.digest(audio),

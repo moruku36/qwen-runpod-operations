@@ -31,7 +31,12 @@ def result(ok: bool, evidence: dict, reason: str, urls=None) -> dict:
 def ui_receipt(path: Path, run_id: str) -> dict:
     if not path.is_file():
         return template()["ui_chat"]
-    row = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return result(False, {"receipt_valid": False}, "UI receipt unreadable or malformed")
+    if not isinstance(row, dict):
+        return result(False, {"receipt_valid": False}, "UI receipt must be an object")
     ok = (row.get("run_id") == run_id and row.get("observer") == "owner"
           and row.get("input_to_display") is True and row.get("language") == "ja" and row.get("ctx") == 8192)
     return result(ok, {"owner_observed": ok, "ctx": 8192}, "owner receipt for authenticated Japanese UI at 8k")
@@ -111,7 +116,7 @@ def context_check(app, post, get, memory) -> dict:
 
 
 def run(app, fixture_dir: Path, *, allow_search: bool = False, audio: Path | None = None,
-        transcript: str | None = None, deadline: float | None = None, cancel=None) -> dict:
+        transcript: str | None = None, deadline: float | None = None, cancel=None, on_result=None) -> dict:
     """Invoke only on the approved Pod. Every unattempted feature remains skipped with a reason."""
     from . import smoke
     out = template()
@@ -120,11 +125,15 @@ def run(app, fixture_dir: Path, *, allow_search: bool = False, audio: Path | Non
     def attempt(name, fn):
         if not ready():
             out[name]["reason"] = "test deadline or cancellation reached"
+            if on_result:
+                on_result(name, out[name])
             return
         try:
             out[name] = fn()
         except Exception as exc:
             out[name] = result(False, {"error_type": type(exc).__name__}, "runtime attempt failed")
+        if on_result:
+            on_result(name, out[name])
     image = fixture_dir / "vision.png"
     sha = make_vision_fixture(image)
     def vision():

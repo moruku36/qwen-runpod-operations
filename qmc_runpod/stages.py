@@ -267,11 +267,7 @@ def stage_venv(r: Runner, lock: Path, *, python: str | None = None, kernel_prefi
         r.mark("kernel_registered", False)
         if rc != 0:
             raise StageError(f"kernel registration failed with exit code {rc}")
-        r.run("venv", [str(envsetup.venv_python(r.root)), "-c",
-              "import pathlib,sys;from jupyter_client.kernelspec import KernelSpecManager;"
-              f"s=KernelSpecManager({('kernel_dirs=' + repr([str(kernel_prefix / 'share/jupyter/kernels')])) if kernel_prefix else ''}).get_kernel_spec({envsetup.KERNEL_NAME!r});"
-              "assert pathlib.Path(s.argv[0]).resolve()==pathlib.Path(sys.executable).resolve();"
-              "print('kernelspec interpreter verified')"], env=env)
+        r.run("venv", envsetup.kernel_verify_cmd(r.root, kernel_prefix), env=env)
         r.mark("kernel_registered", True)
     r.set_status("venv", "ok", kernel=envsetup.KERNEL_NAME if register_kernel else "not_registered")
 
@@ -323,7 +319,10 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
     import gradio
 
     from . import launch, report, smoke, trial
+    from . import control, features
 
+    if r.run_id and "trial" in r.status():
+        raise StageError("trial already attempted in this run; use a fresh run ID and root")
     r.set_status("trial", "running", mock=mock)
     env = layout.apply_env(r.root, ctx=8192, web_search="off")
     checks = r.checks()
@@ -333,60 +332,86 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
                                    "revision": pins.MODELS["mmproj"]["revision"], "sha256_verified": False, "size_bytes": 0}]
     build = {"cuda_archs": "none", "runtime_tag": "mock", "build_type": "none", "build_seconds": 0.0, "built_this_run": False}
     server_version = "mock"
-    if not mock:
-        info = json.loads((r.runs / "build.json").read_text())
-        model_paths = tuple(Path(p) if p else None for p in info["model_paths"])
-        records, build = info["records"], info["build"]
-        from . import llama
-
-        server_version = llama.server_version(Path(info["server"]))
-    user, pw = "qwen-" + secrets.token_hex(3), secrets.token_urlsafe(18)
-    login = write_login(r.root, user, pw)
-    os.environ["QMC_AUTH_USER"], os.environ["QMC_AUTH_PASSWORD"] = user, pw
-    app = launch.launch(mock=mock, host=host, port=port, model_paths=model_paths)
+    app, failure = None, None
+    metrics, gpu, feature_results = {}, {}, features.template()
+    notes = ["report_exported is confirmed outside the Pod after read-back", "perf criteria need 10 warm runs"]
+    if mock:
+        notes.append("CPU rehearsal with the mock backend")
+    def sample_saved(rows):
+        metrics["warm_samples"] = list(rows)
+        r._write(r.runs / "warm-samples.json", {"samples": rows})
+    def work():
+        control.check_work(test_deadline, r.root / "CANCEL")
     try:
-        report.mark(checks, "app_launch", True)
-        report.mark(checks, "auth_enforced", launch.check_auth_enforced(app.cfg.server_port, host or "127.0.0.1"))
-        r.event("trial", f"UI up on port {app.cfg.server_port}; login file: {login}")
-        load = smoke.load_model(app)
-        first = smoke.first_response(app)
-        gpu = smoke.gpu_memory_mib()
-        report.mark(checks, "first_response", (not first["error"]) and first["stream_deltas"] > 0)
-        metrics = {"load_s": load["load_s"], "first_max_tokens": first["max_tokens"], "first_total_s": first["total_s"],
-                   "first_stream_deltas": first["stream_deltas"], "first_finish_reason": first["finish_reason"]}
-        if first["first_delta_s"] is not None:
-            metrics["first_first_delta_s"] = first["first_delta_s"]
-        if gpu.get("used_mib") is not None:
-            metrics["vram_used_mib"] = gpu["used_mib"]
-        if warm and checks["first_response"] == "pass":
-            prompts = ["日本の四季を50字で説明して。", "1から10までの和は？", "Pythonでリストを逆順にする方法は？",
-                       "富士山の高さは？", "挨拶を一言。", "Gitのcommitとpushの違いは？",
-                       "味噌汁の基本の作り方を3行で。", "TCPとUDPの違いを一言で。", "今日の気分を一言で。", "素数とは？"]
-            runs = smoke.warm_runs(app, prompts, on_sample=lambda rows: r._write(r.runs / "warm-samples.json", {"samples": rows}))
-            summary = smoke.summarize(runs)
-            crit = smoke.evaluate_criteria(runs)
-            report.mark(checks, "warm_runs", summary["ok_runs"] == len(prompts))
-            report.mark(checks, "perf_criteria", None if crit["verdict"] == "not_evaluated" else crit["verdict"] == "pass")
-            metrics.update({"warm_" + k: v for k, v in summary.items()})
-            metrics["warm_samples"] = runs
-        from . import features
-        # UI observation belongs to the 8k baseline, before the explicit 32k reload.
-        deadline = time.monotonic() + hold_min * 60
-        while time.monotonic() < deadline and not (r.root / "ui-check.json").exists():
-            if (r.root / "CANCEL").exists() or (test_deadline is not None and time.time() >= test_deadline):
-                break
-            r.event("trial", f"8k UI observation window; {int(deadline - time.monotonic())}s left")
-            time.sleep(min(5, max(.1, deadline - time.monotonic())))
-        feature_results = features.template()
-        if full_features and not mock and checks["first_response"] == "pass" and checks["auth_enforced"] == "pass":
-            feature_results = features.run(app, r.root / "fixtures", allow_search=allow_search,
-                                           audio=audio, transcript=transcript, deadline=test_deadline,
-                                           cancel=r.root / "CANCEL")
-        elif mock:
-            for row in feature_results.values():
-                row["reason"] = "CPU mock is not real feature evidence"
-        if not mock and r.run_id:
-            feature_results["ui_chat"] = features.ui_receipt(r.root / "ui-check.json", r.run_id)
+        with control.work_guard(test_deadline, r.root / "CANCEL"):
+            if not mock:
+                info = json.loads((r.runs / "build.json").read_text())
+                model_paths = tuple(Path(p) if p else None for p in info["model_paths"])
+                records, build = info["records"], info["build"]
+                from . import llama
+                server_version = llama.server_version(Path(info["server"]))
+            user, pw = "qwen-" + secrets.token_hex(3), secrets.token_urlsafe(18)
+            login = write_login(r.root, user, pw)
+            os.environ["QMC_AUTH_USER"], os.environ["QMC_AUTH_PASSWORD"] = user, pw
+            app = launch.launch(mock=mock, host=host, port=port, model_paths=model_paths)
+            report.mark(checks, "app_launch", True)
+            report.mark(checks, "auth_enforced", launch.check_auth_enforced(app.cfg.server_port, host or "127.0.0.1"))
+            r.event("trial", f"UI up on port {app.cfg.server_port}; login file: {login}")
+            load = smoke.load_model(app)
+            work()
+            first = smoke.first_response(app)
+            gpu = smoke.gpu_memory_mib()
+            report.mark(checks, "first_response", (not first["error"]) and first["stream_deltas"] > 0)
+            metrics = {"load_s": load["load_s"], "first_max_tokens": first["max_tokens"], "first_total_s": first["total_s"],
+                       "first_stream_deltas": first["stream_deltas"], "first_finish_reason": first["finish_reason"]}
+            if first["first_delta_s"] is not None:
+                metrics["first_first_delta_s"] = first["first_delta_s"]
+            if gpu.get("used_mib") is not None:
+                metrics["vram_used_mib"] = gpu["used_mib"]
+            if warm and checks["first_response"] == "pass":
+                prompts = ["日本の四季を50字で説明して。", "1から10までの和は？", "Pythonでリストを逆順にする方法は？",
+                           "富士山の高さは？", "挨拶を一言。", "Gitのcommitとpushの違いは？",
+                           "味噌汁の基本の作り方を3行で。", "TCPとUDPの違いを一言で。", "今日の気分を一言で。", "素数とは？"]
+                runs = smoke.warm_runs(app, prompts, on_sample=sample_saved, before_sample=work)
+                summary = smoke.summarize(runs)
+                crit = smoke.evaluate_criteria(runs)
+                report.mark(checks, "warm_runs", summary["ok_runs"] == len(prompts))
+                report.mark(checks, "perf_criteria", None if crit["verdict"] == "not_evaluated" else crit["verdict"] == "pass")
+                metrics.update({"warm_" + k: v for k, v in summary.items()})
+                metrics["warm_samples"] = runs
+            # UI observation belongs to the 8k baseline, before the explicit 32k reload.
+            deadline = time.monotonic() + hold_min * 60
+            while time.monotonic() < deadline and not (r.root / "ui-check.json").exists():
+                if (r.root / "CANCEL").exists() or (test_deadline is not None and time.time() >= test_deadline):
+                    break
+                r.event("trial", f"8k UI observation window; {int(deadline - time.monotonic())}s left")
+                time.sleep(min(5, max(.1, deadline - time.monotonic())))
+            # Freeze the 8k observation before feature adapters may reload at 32k or rewrite files.
+            ui_snapshot = features.ui_receipt(r.root / "ui-check.json", r.run_id) if not mock and r.run_id else None
+            feature_results = features.template()
+            if ui_snapshot is not None:
+                feature_results["ui_chat"] = ui_snapshot
+            if full_features and not mock and checks["first_response"] == "pass" and checks["auth_enforced"] == "pass":
+                feature_results = features.run(app, r.root / "fixtures", allow_search=allow_search,
+                                               audio=audio, transcript=transcript, deadline=test_deadline,
+                                               cancel=r.root / "CANCEL",
+                                               on_result=lambda name,row: feature_results.update({name: row}))
+            elif mock:
+                for row in feature_results.values():
+                    row["reason"] = "CPU mock is not real feature evidence"
+            if ui_snapshot is not None:
+                feature_results["ui_chat"] = ui_snapshot
+    except control.WorkInterrupted:
+        failure = "work_interrupted"
+        notes.append("work interrupted; diagnostic export within separate outer deadline")
+        for row in feature_results.values():
+            if row["status"] == "skipped":
+                row["reason"] = "work deadline or cancellation; not completed"
+    except Exception as exc:
+        failure = type(exc).__name__
+        notes.append("runtime failed: " + failure)
+    try:
+        # Finalize even on work cancellation/error. Producer export remains skipped until off-Pod receipt.
         for name, row in feature_results.items():
             checks[name] = row["status"]
         rep = trial.build_report(
@@ -395,8 +420,7 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
             build=build, checks=checks, metrics=metrics, server_version=server_version, gradio_version=gradio.__version__,
             settings={"ctx": int(env["QMC_CHAT_CTX"]), "thinking": False, "web_search": "off", "asr_device": "cpu",
                       "asr_model": "small", "tts": False, "share": False, "chat_only": True},
-            notes=["report_exported is confirmed outside the Pod after read-back", "perf criteria need 10 warm runs"]
-            + (["CPU rehearsal with the mock backend"] if mock else []))
+            notes=notes, capture_runtime=failure is None)
         rep["execution_mode"] = "cpu_mock" if mock else "real_gpu"
         rep["features"] = feature_results
         path = report.write_report(rep, r.runs)
@@ -404,11 +428,12 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
         report.make_bundle([path], bundle)
         r._write(r.checks_path, checks)
         r.emit_artifact(bundle)
-        failed = any(checks[name] == "fail" for name in ("auth_enforced", "first_response", "warm_runs"))
+        failed = failure is not None or any(checks[name] == "fail" for name in ("auth_enforced", "first_response", "warm_runs"))
         r.set_status("trial", "fail" if failed else "ok", bundle=bundle.name,
                      feature_coverage="partial" if any(row["status"] == "skipped" for row in feature_results.values()) else "attempted")
         if failed:
-            raise StageError("trial acceptance failed; diagnostic bundle was emitted")
+            raise StageError("trial interrupted or acceptance failed; diagnostic bundle was emitted")
         return bundle
     finally:
-        launch.stop_app(app)
+        if app is not None:
+            launch.stop_app(app)

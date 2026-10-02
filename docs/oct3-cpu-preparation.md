@@ -23,10 +23,16 @@ real local process deadlines, corrupted tar bundles and a local log round trip.
 They do not prove CUDA, full application UI or real model features. Existing
 pytest is available only in CPython 3.10 here; no dependencies were installed.
 Test counts, interpreter versions and exits are in the local preparation evidence.
-Final standard-library suite: 35 tests passed on isolated CPython3.11.9.
-Final existing pytest suite including these tests: 96 passed, 14 skipped on
-CPython3.10. The overlapping tests are not 131 distinct successes. Skipped remains
-skipped. A separate end-to-end CPU control/export rehearsal is retained locally.
+Reviewed baseline b324fb8: 35 standard-library tests passed on isolated CPython3.11.9,
+and existing pytest (including those tests) had 96 passed, 14 skipped on CPython3.10.
+The overlapping tests are not 131 distinct successes. Review corrections add Linux
+negative cases and diagnostic cancellation tests; their fresh results are retained
+with the new execution SHA. Skipped remains skipped. A separate end-to-end CPU
+control/export rehearsal is retained locally.
+Review-fix suite: 49 collected standard-library tests, 45 pass/4 POSIX skips on
+Windows CPython3.11 and 49 pass on existing WSL CPython3.12; the existing pytest
+suite includes these cases. The production Gradio application still has not been
+rehearsed with the Linux CPython3.11 lock.
 Early test attempts failed on Windows temp permissions, text encoding and POSIX
 assumptions; the final run uses a fresh workspace temp directory and UTF-8 mode.
 POSIX-only checks and unavailable upstream/app dependencies are explicitly skipped.
@@ -48,8 +54,10 @@ POSIX-only checks and unavailable upstream/app dependencies are explicitly skipp
   External owner initiates Stop by T+110 (or earlier budget deadline) and verifies
   by T+120. No resource creation, restart, deletion or external agent exists in the
   new controller. Windows cancellation targets only the controller's started PID
-  tree; a venv launcher child was caught by the deadline test. Native Linux process
-  group behavior still requires a Linux CPU rehearsal before paid launch.
+  tree; a venv launcher child was caught by the deadline test. Existing WSL tests
+  cover Linux stragglers after leader exit, TERM-ignoring children, group-disappearance
+  races and a blocked trial's inner deadline/diagnostic export on Python3.12.
+  The target Python3.11 full UI rehearsal remains a separate missing gate.
 - Build/download times are separate; missing server or incomplete model records fail.
 - Warm samples retain errors, finish reasons and chunk counts in report JSON and
   are checkpointed after each sample on disk. Unknown/incomplete finish cannot pass
@@ -77,6 +85,23 @@ is deliberately invalid while these values are unset. Keep the packet outside th
 checkout to preserve a clean tree. Record both UTC and JST externally. Review pip
 progress at 10 minutes; G2 incomplete at 20 minutes requires the external stop
 decision. Do not improvise a fixed 240-second pip timeout.
+
+The packet now separates `test_deadline` (no later than T+100), `export_deadline`
+(no later than T+110, at least 30 seconds after work ends), and `stop_deadline`
+(Stop verification by T+120). An earlier budget deadline wins. Linux main-thread
+work receives SIGALRM at the inner deadline, then creates a diagnostic bundle
+under the separate outer bound. Warm loops check cancellation before each sample,
+and completed warm/feature/UI observations survive interruption. Cancellation gives
+up to 30 seconds of bounded signal grace within the outer time remaining. No new
+CUDA metadata subprocesses run during failure diagnostics. External Stop remains
+mandatory; these process bounds never establish billing control.
+
+Failed/cancelled runs and interrupted in-flight trials are terminal: use a new
+run ID and root. Even direct stage invocation cannot emit a second same-name trial
+bundle for an existing run. Do not resume an old checkpoint to retry inference.
+Kernelspec verification compares the intended venv path and prefix, rather than
+resolving its Python symlink to the OS binary. UI receipts are snapshotted before
+feature/context changes; malformed receipts produce a fail row without aborting export.
 
 ```sh
 python3 scripts/retry_run.py /workspace/private-packet.json --validate
@@ -123,7 +148,10 @@ external stop and billing remain human actions. One-paste autonomy is not promis
 1. Full Gradio/auth/application CPU rehearsal in an isolated CPython3.11 environment
    with reviewed compatible dependencies. Current lock targets Linux x86_64
    manylinux_2_35, not Windows. No ad-hoc system packages or security changes.
-2. A licensed short speech fixture and known transcript. ASR source metadata only
+2. Select and document the speech fixture's use assumptions and its paths/hashes.
+   A supplementary offline Windows standard-voice fixture and known transcript
+   were generated outside the reviewed candidate; no personal voice or paid API.
+   ASR source metadata only
    was read from the public Hugging Face model API; fixed model revision is
    `Systran/faster-whisper-small@536b0662742c02347bc0e980a01041f333bce120`.
    No ASR or Qwen weights have been fetched. Audio decoding/transcription, CUDA,
@@ -133,7 +161,8 @@ external stop and billing remain human actions. One-paste autonomy is not promis
    session reply round trip is still unverified; no live third-party agent was called.
 4. Final review/pin and deployment of this local branch. Nothing was pushed/merged.
 
-If a deadline kills the trial during load/warm/features, local checkpoint/raw sample
-files may exist but a final report bundle may be absent. Mark export incomplete,
+The new diagnostic reserve is tested with CPU fakes; it is not guaranteed recovery
+from SIGKILL, kernel OOM, uninterruptible I/O or failed export. If those prevent finalization,
+local checkpoint/raw sample files may exist but a final report bundle may be absent. Mark export incomplete,
 retrieve available allowlisted diagnostics if possible, and Stop first if required
 by cost/time. Do not delete resources or relabel missing evidence pass.

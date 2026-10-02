@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,8 +18,31 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
-from qmc_runpod import features, logchannel, report, retry, smoke, stages, envsetup, podapi
+from qmc_runpod import control, features, logchannel, report, retry, smoke, stages, envsetup, podapi
 import read_pod_logs
+
+
+@contextlib.contextmanager
+def trial_fakes(r, *, generate=None, feature_run=None, load=None):
+    """Exercise production trial/report flow without Gradio, GPU, model, provider or credential use."""
+    from qmc_runpod import launch, llama, provenance
+    records=[{"role":role,"file":spec["file"],"revision":spec["revision"],"sha256_verified":False,"size_bytes":0}
+             for role,spec in stages.pins.MODELS.items()]
+    r._write(r.runs/"build.json",{"server":"cpu-fake","model_paths":["cpu-fake.gguf",None],"records":records,
+                                 "build":{"cuda_archs":"none","runtime_tag":"cpu_fake","build_type":"none","build_seconds":0,"built_this_run":False}})
+    app=SimpleNamespace(cfg=SimpleNamespace(server_port=17861))
+    sample={"first_delta_s":.1,"total_s":.2,"stream_deltas":2,"finish_reason":"stop","max_tokens":64,"error":False,"phase":"first"}
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.dict(sys.modules,{"gradio":SimpleNamespace(__version__="cpu_fake")}))
+        for obj,name,value in ((launch,"launch",lambda **kw:app),(launch,"check_auth_enforced",lambda *a:True),
+                               (launch,"stop_app",lambda app:None),(llama,"server_version",lambda p:"cpu_fake"),
+                               (smoke,"load_model",load or (lambda app:{"load_s":.1})),
+                               (smoke,"first_response",lambda app:sample),(smoke,"gpu_memory_mib",lambda:{}),
+                               (provenance,"nvcc_release",lambda:"not_run"),(provenance,"driver_cuda_version",lambda:"not_run")):
+            stack.enter_context(patch.object(obj,name,value))
+        if generate:stack.enter_context(patch.object(smoke,"generate",generate))
+        if feature_run:stack.enter_context(patch.object(features,"run",feature_run))
+        yield app
 
 
 class CPU(unittest.TestCase):
@@ -35,7 +59,7 @@ class CPU(unittest.TestCase):
         transcript=self.p/"mock-transcript.txt";transcript.write_text("Synthetic test transcript")
         return {"run_id": "cpu-run-123", "commit": "a"*40, "root": str(self.p / "ws"),
                 "stages": list(retry.STAGES), "allocated_at": "2026-10-03T01:00:00+00:00",
-                "test_deadline": "2026-10-03T02:40:00+00:00", "stop_deadline": "2026-10-03T03:00:00+00:00",
+                "test_deadline": "2026-10-03T02:40:00+00:00", "export_deadline": "2026-10-03T02:50:00+00:00", "stop_deadline": "2026-10-03T03:00:00+00:00",
                 "approval_date": "2026-10-03", "cap_usd": 10, "quote_total_usd": 4.49,
                 "export_destination": "owner-private-destination", "lock_sha256": retry.digest(ROOT/"requirements-runpod.lock.txt"),
                 "feature_options": {"allow_public_search":True,"audio":str(audio),"audio_sha256":retry.digest(audio),
@@ -102,6 +126,42 @@ class CPU(unittest.TestCase):
         with patch.object(retry,"validate_packet"):
             self.assertEqual(retry.execute(p,ROOT,command=fail),9)
         self.assertEqual(calls,["selftest"])
+    def test_failed_or_cancelled_trial_cannot_reemit_same_run(self):
+        for terminal in ("failed","cancelled","running"):
+            p=self.packet();p["root"]=str(self.p/terminal);root=Path(p["root"]);root.mkdir()
+            state={"run_id":p["run_id"],"packet_sha256":hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest(),
+                   "completed":list(retry.STAGES[:-1]),"current_stage":"trial","state":terminal}
+            (root/"retry-checkpoint.json").write_text(json.dumps(state))
+            calls=[]
+            with patch.object(retry,"validate_packet"):
+                with self.assertRaisesRegex(ValueError,"terminal"):
+                    retry.execute(p,ROOT,command=lambda *a,**kw:calls.append(a))
+            self.assertEqual(calls,[])
+    def test_command_exception_marks_terminal_checkpoint(self):
+        p=self.packet()
+        def fail(*a,**kw):raise RuntimeError("CPU test cleanup failure")
+        with patch.object(retry,"validate_packet"):
+            with self.assertRaises(RuntimeError):retry.execute(p,ROOT,command=fail)
+            state=json.loads((Path(p["root"])/"retry-checkpoint.json").read_text())
+            self.assertEqual(state["state"],"failed")
+            with self.assertRaisesRegex(ValueError,"terminal"):retry.execute(p,ROOT,command=fail)
+    def test_trial_has_separate_export_reserve(self):
+        p=self.packet();p["export_deadline"]=p["test_deadline"]
+        with self.assertRaises(ValueError):self.validate(p)
+    def test_test_and_export_deadlines_respect_approved_milestones(self):
+        for key,value in (("test_deadline","2026-10-03T02:41:00+00:00"),("export_deadline","2026-10-03T02:51:00+00:00")):
+            p=self.packet();p[key]=value
+            with self.assertRaises(ValueError):self.validate(p)
+    def test_outer_trial_uses_export_deadline(self):
+        p=self.packet();root=Path(p["root"]);root.mkdir()
+        state={"run_id":p["run_id"],"packet_sha256":hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest(),
+               "completed":list(retry.STAGES[:-1]),"state":"running"}
+        (root/"retry-checkpoint.json").write_text(json.dumps(state));seen=[]
+        def command(cmd,**kw):seen.append(kw["seconds"]);return self.fake_stage(cmd,**kw)
+        clock=lambda:dt.datetime(2026,10,3,1,5,tzinfo=dt.timezone.utc)
+        with patch.object(retry,"validate_packet"):
+            self.assertEqual(retry.execute(p,ROOT,clock=clock,command=command),0)
+        self.assertEqual(seen,[6300])
     def test_stale_root_rejected(self):
         p=self.packet();Path(p["root"]).mkdir();(Path(p["root"])/"old").touch()
         with patch.object(retry,"validate_packet"):
@@ -175,6 +235,99 @@ class CPU(unittest.TestCase):
         self.assertEqual(features.ui_receipt(path,"new-run-123")["status"],"fail")
         row["run_id"]="new-run-123";path.write_text(json.dumps(row))
         self.assertEqual(features.ui_receipt(path,"new-run-123")["status"],"pass")
+    def test_malformed_ui_receipt_is_fail_not_exception(self):
+        path=self.p/"ui.json"
+        for text in ("{broken","[]","null","42"):
+            path.write_text(text)
+            self.assertEqual(features.ui_receipt(path,"cpu-run-123")["status"],"fail")
+    def read_bundle_report(self,bundle):
+        with tarfile.open(bundle) as tar:
+            return json.load(tar.extractfile(next(m.name for m in tar.getmembers() if m.name.startswith("report-"))))
+    def test_ui_snapshot_precedes_feature_reload(self):
+        r=stages.Runner(self.p/"ws",mirror=None,run_id="cpu-run-123")
+        receipt={"run_id":"cpu-run-123","observer":"owner","input_to_display":True,"language":"ja","ctx":8192}
+        path=r.root/"ui-check.json";path.write_text(json.dumps(receipt))
+        def reload(*a,**kw):
+            receipt["ctx"]=32768;path.write_text(json.dumps(receipt));return features.template()
+        with trial_fakes(r,feature_run=reload):bundle=stages.stage_trial(r,full_features=True)
+        rep=self.read_bundle_report(bundle)
+        self.assertEqual(rep["features"]["ui_chat"]["status"],"pass")
+        self.assertEqual(json.loads(path.read_text())["ctx"],32768)
+    def test_malformed_ui_still_exports_diagnostic_bundle(self):
+        r=stages.Runner(self.p/"ws",mirror=self.p/"mirror",run_id="cpu-run-123")
+        (r.root/"ui-check.json").write_text("[]")
+        with trial_fakes(r):bundle=stages.stage_trial(r)
+        self.assertEqual(self.read_bundle_report(bundle)["checks"]["ui_chat"],"fail")
+        self.assertEqual(report.verify_bundle(bundle),[])
+        self.assertTrue(logchannel.decode_artifacts((self.p/"mirror").read_text().splitlines(),run_id="cpu-run-123")[bundle.name]["ok"])
+    def test_warm_cancellation_preserves_partial_samples(self):
+        r=stages.Runner(self.p/"ws",mirror=None,run_id="cpu-run-123")
+        def generate(*a,**kw):
+            (r.root/"CANCEL").touch()
+            return {"first_delta_s":.1,"total_s":.2,"stream_deltas":2,"finish_reason":"stop","max_tokens":256,"error":False}
+        with trial_fakes(r,generate=generate):
+            with self.assertRaises(stages.StageError):stages.stage_trial(r,mock=True,warm=True)
+        bundle=next(r.runs.glob("*.tar.gz"));rep=self.read_bundle_report(bundle)
+        self.assertEqual(len(rep["metrics"]["warm_samples"]),1)
+        self.assertEqual(rep["checks"]["perf_criteria"],"skipped")
+        self.assertEqual(r.status()["trial"]["state"],"fail")
+        saved_sha=retry.digest(bundle)
+        with trial_fakes(r):
+            with self.assertRaisesRegex(stages.StageError,"already attempted"):
+                stages.stage_trial(r,mock=True)
+        self.assertEqual(retry.digest(bundle),saved_sha)
+    def test_interrupted_features_preserve_completed_row_and_ui(self):
+        r=stages.Runner(self.p/"ws",mirror=None,run_id="cpu-run-123")
+        (r.root/"ui-check.json").write_text(json.dumps({"run_id":"cpu-run-123","observer":"owner","input_to_display":True,"language":"ja","ctx":8192}))
+        def interrupt(*a,**kw):
+            kw["on_result"]("image_understanding",features.result(False,{"attempted":True},"CPU test failure"))
+            raise control.WorkInterrupted()
+        with trial_fakes(r,feature_run=interrupt):
+            with self.assertRaises(stages.StageError):stages.stage_trial(r,full_features=True)
+        rep=self.read_bundle_report(next(r.runs.glob("*.tar.gz")))
+        self.assertEqual(rep["checks"]["ui_chat"],"pass")
+        self.assertEqual(rep["checks"]["image_understanding"],"fail")
+        self.assertEqual(rep["checks"]["ctx_32k"],"skipped")
+    @unittest.skipUnless(os.name=="posix","Linux venv symlink identity")
+    def test_real_venv_kernel_rejects_base_python_symlink_target(self):
+        root=self.p/"kernel";subprocess.run(envsetup.create_cmd(root,without_pip=True),check=True)
+        code=(f"import sys;from pathlib import Path;sys.path.insert(0,{str(ROOT)!r});"
+              "from qmc_runpod.envsetup import kernel_identity_ok;"
+              f"root=Path({str(root)!r});assert kernel_identity_ok(sys.executable,root);"
+              "assert not kernel_identity_ok(str(Path(sys.executable).resolve()),root)")
+        self.assertEqual(subprocess.run([str(envsetup.venv_python(root)),"-c",code]).returncode,0)
+    @unittest.skipUnless(sys.platform.startswith("linux"),"owned Linux process-group stragglers")
+    def test_exited_leader_does_not_leave_term_ignoring_child(self):
+        pidfile=self.p/"child.pid"
+        child="import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)"
+        code=(f"import subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c',{child!r}]);"
+              f"Path({str(pidfile)!r}).write_text(str(p.pid));time.sleep(.2)")
+        self.assertEqual(retry.bounded_command([sys.executable,"-c",code],seconds=2,cancel_file=self.p/"CANCEL",output=self.p/"out",grace_seconds=.1),0)
+        child_pid=int(pidfile.read_text());end=time.monotonic()+2
+        while time.monotonic()<end:
+            stat=Path(f"/proc/{child_pid}/stat")
+            if not stat.exists() or stat.read_text().rsplit(")",1)[1].split()[0]=="Z":break
+            time.sleep(.05)
+        else:self.fail("owned straggler still live")
+    @unittest.skipUnless(os.name=="posix","POSIX signal disappearance race")
+    def test_group_disappearance_race_is_harmless(self):
+        proc=SimpleNamespace(pid=123456,_qmc_owned_session=True,wait=lambda **kw:None)
+        with patch.object(retry,"_live_group",return_value=True),patch.object(os,"killpg",side_effect=ProcessLookupError):
+            retry.terminate_tree(proc,grace_seconds=0)
+    @unittest.skipUnless(os.name=="posix","Linux main-thread work deadline")
+    def test_inner_deadline_exports_while_outer_process_still_alive(self):
+        root=self.p/"deadline"
+        code=(f"import sys,time;from pathlib import Path;sys.path.insert(0,{str(ROOT/'tests')!r});"
+              "from test_retry_cpu import trial_fakes;from qmc_runpod import stages;"
+              f"r=stages.Runner(Path({str(root)!r}),mirror=None,run_id='cpu-run-123');\n"
+              "with trial_fakes(r,load=lambda app:time.sleep(20)):\n"
+              " try:stages.stage_trial(r,mock=True,test_deadline=time.time()+.15)\n"
+              " except stages.StageError:pass\n")
+        started=time.monotonic()
+        self.assertEqual(retry.bounded_command([sys.executable,"-c",code],seconds=3,cancel_file=self.p/"CANCEL",output=self.p/"out"),0)
+        self.assertLess(time.monotonic()-started,3)
+        bundle=next((root/"runs").glob("*.tar.gz"));self.assertEqual(report.verify_bundle(bundle),[])
+        self.assertEqual(self.read_bundle_report(bundle)["checks"]["first_response"],"skipped")
     def test_deadline_skips_real_features(self):
         rows=features.run(None,self.p,deadline=0)
         self.assertEqual({r["status"] for r in rows.values()},{"skipped"})

@@ -76,10 +76,12 @@ def first_response(app, prompt: str = SHORT_PROMPT, max_tokens: int = FIRST_MAX_
     return {"phase": "first", **generate(app, prompt, max_tokens=max_tokens)}
 
 
-def warm_runs(app, prompts: list[str], max_tokens: int = WARM_MAX_TOKENS, *, on_sample=None) -> list[dict]:
+def warm_runs(app, prompts: list[str], max_tokens: int = WARM_MAX_TOKENS, *, on_sample=None, before_sample=None) -> list[dict]:
     """Run only after first_response succeeded. Same cap for every run."""
     runs = []
     for p in prompts:
+        if before_sample:
+            before_sample()
         runs.append({"phase": "warm", **generate(app, p, max_tokens=max_tokens)})
         if on_sample:
             on_sample(runs)
