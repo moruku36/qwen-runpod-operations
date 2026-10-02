@@ -166,7 +166,7 @@ def bounded_command(cmd: list[str], *, seconds: float, cancel_file: Path, output
                 time.sleep(min(0.1, max(0, end - time.monotonic())))
             return proc.returncode
         finally:
-            terminate_tree(proc, grace_seconds=grace_seconds)
+            terminate_tree(proc, grace_seconds=min(grace_seconds, max(0, end-time.monotonic())))
 
 
 def execute(p: dict, repo: Path, *, clock=None, command=None) -> int:
@@ -217,7 +217,8 @@ def execute(p: dict, repo: Path, *, clock=None, command=None) -> int:
         if stage == "trial":
             f = p["feature_options"]
             cmd += ["--warm", "--features", "--hold-min", "2", "--allow-public-search", "--audio", f["audio"],
-                    "--transcript-file", f["transcript_file"], "--test-deadline", str(instant(p["test_deadline"]).timestamp())]
+                    "--transcript-file", f["transcript_file"], "--test-deadline", str(instant(p["test_deadline"]).timestamp()),
+                    "--export-deadline", str(instant(p["export_deadline"]).timestamp())]
         state.update(state="running", current_stage=stage); save()
         try:
             rc = command(cmd, seconds=left, cancel_file=root / "CANCEL", output=root / "bootstrap.log",

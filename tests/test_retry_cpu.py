@@ -332,6 +332,82 @@ class CPU(unittest.TestCase):
         rows=features.run(None,self.p,deadline=0)
         self.assertEqual({r["status"] for r in rows.values()},{"skipped"})
         self.assertIn("licensed",rows["asr"]["reason"])
+    def test_work_base_exceptions_cleanup_and_export(self):
+        from qmc_runpod import launch
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                r=stages.Runner(self.p/exc.__name__,mirror=None,run_id="cpu-run-123")
+                def interrupted(app):raise exc()
+                with trial_fakes(r,load=interrupted),patch.object(launch,"stop_app") as stop:
+                    with self.assertRaises(stages.StageError):stages.stage_trial(r,mock=True)
+                    stop.assert_called_once()
+                self.assertEqual(report.verify_bundle(next(r.runs.glob("*.tar.gz"))),[])
+    def test_export_base_exceptions_cleanup(self):
+        from qmc_runpod import launch
+        for exc in (KeyboardInterrupt,SystemExit):
+            with self.subTest(exc=exc.__name__):
+                r=stages.Runner(self.p/exc.__name__,mirror=None,run_id="cpu-run-123")
+                with trial_fakes(r),patch.object(launch,"stop_app") as stop,patch.object(r,"emit_artifact",side_effect=exc):
+                    with self.assertRaises(exc):stages.stage_trial(r,mock=True)
+                    stop.assert_called_once()
+    def test_early_interruption_preserves_new_ui_receipt(self):
+        r=stages.Runner(self.p/"ui",mirror=None,run_id="cpu-run-123")
+        def interrupted(app):
+            (r.root/"ui-check.json").write_text(json.dumps({"run_id":r.run_id,"observer":"owner","input_to_display":True,"language":"ja","ctx":8192}))
+            raise control.WorkInterrupted()
+        with trial_fakes(r,load=interrupted):
+            with self.assertRaises(stages.StageError):stages.stage_trial(r)
+        rep=self.read_bundle_report(next(r.runs.glob("*.tar.gz")))
+        self.assertEqual(rep["checks"]["ui_chat"],"pass")
+        self.assertIn("not completed",rep["features"]["ctx_32k"]["reason"])
+    def test_unavailable_build_metadata_is_not_mock_success(self):
+        r=stages.Runner(self.p/"build",mirror=None,run_id="cpu-run-123")
+        with trial_fakes(r):
+            (r.runs/"build.json").unlink()
+            with self.assertRaises(stages.StageError):stages.stage_trial(r)
+        rep=self.read_bundle_report(next(r.runs.glob("*.tar.gz")))
+        self.assertEqual(rep["llama_cpp"]["runtime_tag"],"unavailable")
+        self.assertNotIn("build_seconds",rep["llama_cpp"])
+        self.assertEqual(rep["environment"]["cuda_toolkit"],"not_measured")
+    def test_cli_refusal_preserves_prior_status(self):
+        import pod_run
+        r=stages.Runner(self.p/"prior",mirror=None,run_id="cpu-run-123")
+        for state in ("ok","fail"):
+            r.set_status("trial",state,bundle="existing.tar.gz")
+            original=r.status_path.read_bytes()
+            self.assertEqual(pod_run.main(["trial","--mock","--root",str(r.root),"--run-id",r.run_id]),1)
+            self.assertEqual(r.status_path.read_bytes(),original)
+        self.assertTrue((r.logs/"trial-refusal.log").exists())
+    @unittest.skipUnless(os.name=="posix","Linux export-phase cancellation")
+    def test_cancel_during_export_is_deferred_and_cleanup_runs(self):
+        import signal
+        from qmc_runpod import launch
+        r=stages.Runner(self.p/"export",mirror=None,run_id="cpu-run-123")
+        emit=r.emit_artifact
+        def cancelled(path):
+            (r.root/"CANCEL").touch()
+            os.kill(os.getpid(),signal.SIGTERM)
+            os.kill(os.getpid(),signal.SIGINT)
+            emit(path)
+        with trial_fakes(r),patch.object(launch,"stop_app") as stop,patch.object(r,"emit_artifact",side_effect=cancelled):
+            bundle=stages.stage_trial(r,mock=True,export_deadline=time.time()+2)
+            stop.assert_called_once()
+        self.assertEqual(report.verify_bundle(bundle),[])
+    @unittest.skipUnless(os.name=="posix","Linux hard finalization deadline")
+    def test_finalization_timeout_still_attempts_cleanup(self):
+        from qmc_runpod import launch
+        r=stages.Runner(self.p/"export-bound",mirror=None,run_id="cpu-run-123")
+        with trial_fakes(r),patch.object(launch,"stop_app") as stop,patch.object(r,"emit_artifact",side_effect=lambda p:time.sleep(10)):
+            started=time.monotonic()
+            with self.assertRaises(control.WorkInterrupted):stages.stage_trial(r,mock=True,export_deadline=time.time()+.15)
+            stop.assert_called_once()
+            self.assertLess(time.monotonic()-started,1)
+    @unittest.skipUnless(sys.platform.startswith("linux"),"Linux controller outer bound")
+    def test_outer_deadline_kills_term_ignoring_owned_process(self):
+        started=time.monotonic()
+        rc=retry.bounded_command([sys.executable,"-c","import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(20)"],seconds=.2,cancel_file=self.p/"CANCEL",output=self.p/"bound",grace_seconds=30)
+        self.assertEqual(rc,124)
+        self.assertLess(time.monotonic()-started,2)
     def test_context_short_prompt_does_not_pass(self):
         model=SimpleNamespace(ctx_size=8192)
         app=SimpleNamespace(manager=SimpleNamespace(get=lambda n:model,unload=lambda n:None,ensure=lambda n:None))

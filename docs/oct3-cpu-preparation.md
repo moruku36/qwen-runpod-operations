@@ -145,6 +145,17 @@ external stop and billing remain human actions. One-paste autonomy is not promis
 
 ## Remaining no-go items
 
+Follow-up after `fe32f7c`: the Linux signal guard encloses work, export and owned-app
+cleanup. Work TERM/INT triggers diagnostics; export TERM/INT is deferred until the
+immutable export deadline, without extending the controller's hard limit. Direct
+manual calls without a packet get a 30-second export bound after work. Cleanup is
+always attempted for a returned app, including KeyboardInterrupt/SystemExit and
+export errors; SIGKILL/uninterruptible cleanup cannot guarantee completion. Controller
+cleanup grace is capped by remaining outer time (post-KILL observation at most two
+seconds and leader reap at most three seconds). Existing UI receipts are recovered
+on early interruption, missing build metadata is unavailable, and refused reruns
+append a separate refusal event without changing prior status or bundles.
+
 1. Full Gradio/auth/application CPU rehearsal in an isolated CPython3.11 environment
    with reviewed compatible dependencies. Current lock targets Linux x86_64
    manylinux_2_35, not Windows. No ad-hoc system packages or security changes.
