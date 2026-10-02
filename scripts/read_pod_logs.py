@@ -33,7 +33,7 @@ def main(argv=None, api=None):
     parsed = logchannel.parse_events(lines, run_id=a.run_id)
     for ev in parsed[-40:]:
         print(f"{ev['time']} [{ev['stage']}] {ev['message']}")
-    print(f"({len(events)} log events; container lines: {len(lines)}; QMC events: {len(logchannel.parse_events(lines))})")
+    print(f"({len(events)} log events; container lines: {len(lines)}; matching QMC events: {len(parsed)})")
     rc = 0 if parsed else 1
     artifacts = logchannel.decode_artifacts(lines, run_id=a.run_id)
     for expected in a.expect_event:

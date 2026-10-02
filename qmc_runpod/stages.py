@@ -164,7 +164,7 @@ def stage_selftest(r: Runner) -> None:
     """Prove the log channel end to end: an event line and a tiny artifact."""
     r.set_status("selftest", "running")
     probe = r.runs / "selftest.txt"
-    probe.write_text("qmc log channel selftest\n")
+    probe.write_bytes(b"qmc log channel selftest\n")
     r.event("selftest", "hello from the pod")
     r.emit_artifact(probe, "selftest.txt")
     r.set_status("selftest", "ok")
