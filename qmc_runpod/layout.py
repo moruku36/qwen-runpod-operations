@@ -36,6 +36,7 @@ def apply_env(root: Path | None = None, *, ctx: int | None = 8192, web_search: s
         "QMC_THINKING": "false",
         "QMC_WEB_SEARCH": web_search,
         "HF_HUB_DISABLE_TELEMETRY": "1",
+        "GRADIO_ANALYTICS_ENABLED": "False",
     }
     if ctx:
         env["QMC_CHAT_CTX"] = str(ctx)

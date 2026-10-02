@@ -20,14 +20,24 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 # section -> allowed keys. A key mapped to None is a free-form {name: number|bool|short str} dict.
+CHECK_NAMES = (
+    "upstream_pin", "ops_commit_clean", "lock_installed", "llama_built", "models_verified", "app_launch",
+    "auth_enforced", "first_response", "warm_runs", "perf_criteria", "image_understanding", "web_search", "asr",
+    "ctx_32k", "history_restore", "release_reload", "report_exported",
+)
+CHECK_VALUES = ("pass", "fail", "skipped")
+
 SCHEMA = {
     "trial_id": "str",
     "created_at_jst": "str",
+    "source": {"ops_commit": "str", "ops_tree_clean": "bool", "lock_sha256": "str"},
     "upstream": {"sha": "str", "notebook_blob": "str"},
-    "llama_cpp": {"commit": "str", "version_line": "str"},
+    "llama_cpp": {"commit": "str", "version_line": "str", "cuda_archs": "str", "runtime_tag": "str",
+                  "build_type": "str", "build_seconds": "num", "built_this_run": "bool"},
     "models": [{"role": "str", "file": "str", "revision": "str", "sha256_verified": "bool", "size_bytes": "num"}],
     "environment": {"gpu_name": "str", "vram_mib": "num", "driver": "str", "cuda_toolkit": "str",
-                    "python": "str", "gradio": "str", "image": "str"},
+                    "cuda_driver_api": "str", "python": "str", "gradio": "str", "image_tag": "str",
+                    "image_digest": "str"},
     "settings": {"ctx": "num", "thinking": "bool", "web_search": "str", "asr_device": "str",
                  "asr_model": "str", "tts": "bool", "share": "bool", "chat_only": "bool", "profile": "str"},
     "timings_s": None,
@@ -83,9 +93,35 @@ def _check(value, schema, path: str, errs: list[str]) -> None:
                 _scalar_ok(v, "str", f"{path}.{k}", errs)
 
 
+def checks_template() -> dict:
+    """Every known check, all "skipped" until something marks it. Nothing is a pass by default."""
+    return dict.fromkeys(CHECK_NAMES, "skipped")
+
+
+def mark(checks: dict, name: str, ok: bool | None) -> None:
+    """ok=True -> pass, False -> fail, None -> skipped."""
+    if name not in CHECK_NAMES:
+        raise KeyError(name)
+    checks[name] = "skipped" if ok is None else ("pass" if ok else "fail")
+
+
 def validate(report: dict) -> list[str]:
     errs: list[str] = []
     _check(report, SCHEMA, "report", errs)
+    checks = report.get("checks")
+    if isinstance(checks, dict):
+        for name in CHECK_NAMES:
+            if name not in checks:
+                errs.append(f"report.checks.{name}: missing (must be pass, fail or skipped)")
+        for name, value in checks.items():
+            if name not in CHECK_NAMES:
+                errs.append(f"report.checks.{name}: not a known check")
+            elif value not in CHECK_VALUES:
+                errs.append(f"report.checks.{name}: must be one of {CHECK_VALUES}")
+    elif "checks" in report:
+        errs.append("report.checks: expected object")
+    else:
+        errs.append("report.checks: missing")
     return errs
 
 

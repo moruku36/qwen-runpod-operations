@@ -81,6 +81,16 @@ def launch(*, mock: bool = False, profile: str | None = None, host: str | None =
     return app
 
 
+def check_auth_enforced(port: int, host: str = "127.0.0.1") -> bool:
+    """True if an unauthenticated request to the running UI is refused (401/403)."""
+    import requests
+
+    try:
+        return requests.get(f"http://{host}:{port}/config", timeout=10).status_code in (401, 403)
+    except requests.RequestException:
+        return False
+
+
 def stop_app(app) -> None:
     """Stop the web app and the model process. Does NOT stop or delete the Pod."""
     for fn in (lambda: app.demo.close(), lambda: app.manager.unload_all(),

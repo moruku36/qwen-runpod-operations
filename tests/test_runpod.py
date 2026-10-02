@@ -3,6 +3,7 @@ import json
 import re
 import socket
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -181,10 +182,11 @@ def test_fetch_pinned_uses_revisions_and_two_files_only(tmp_path):
 # ---------------------------------------------------------------- report allowlist
 def good_report():
     return {"trial_id": "t1", "created_at_jst": "2026-10-02T15:00:00+09:00",
+            "source": {"ops_commit": "a" * 40, "ops_tree_clean": True, "lock_sha256": "b" * 64},
             "upstream": {"sha": pins.UPSTREAM_SHA, "notebook_blob": pins.UPSTREAM_NOTEBOOK_BLOB},
             "models": [{"role": "chat", "file": "a.gguf", "revision": "r", "sha256_verified": True, "size_bytes": 1}],
             "settings": {"ctx": 8192, "thinking": False, "share": False},
-            "metrics": {"first_text_median_s": 1.2}, "checks": {"chat_smoke": "pass"}, "notes": ["ok"]}
+            "metrics": {"first_first_delta_s": 1.2}, "checks": report.checks_template(), "notes": ["ok"]}
 
 
 def test_report_accepts_allowlisted_and_rejects_everything_else(tmp_path):
@@ -233,13 +235,18 @@ class FakeResp:
 
 
 class FakeSession:
+    """Plays a script of FakeResp or Exception objects, then repeats the last item."""
+
     def __init__(self, script):
         self.script, self.calls = list(script), []
 
     def request(self, method, url, **kw):
         self.calls.append((method, url, kw))
         assert "headers" not in kw, "client must not set auth headers"
-        return self.script.pop(0)
+        item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def api_with(*responses):
@@ -247,77 +254,221 @@ def api_with(*responses):
     return podapi.PodApi(session=s), s
 
 
+NAME = "qwen-trial-20261002-143000-ab12"
+JST = podapi.JST
+
+
+def est(total=5.0):
+    return {"total_usd": total}
+
+
 def test_create_body_matches_plan():
-    b = podapi.build_create_body(name="n", gpu_id="NVIDIA A100-SXM4-80GB", data_center_ids=["US-MD-1"])
+    b = podapi.build_create_body(name=NAME, gpu_id="NVIDIA A100-SXM4-80GB", data_center_ids=["US-MD-1"])
     assert b["gpu"] == {"id": "NVIDIA A100-SXM4-80GB", "count": 1}
     assert b["disk"] == 20 and b["mounts"] == {"persistent": {"size": 80, "path": "/workspace"}}
-    assert b["cloud"] == "SECURE" and b["startSsh"] is False and "env" not in b and "mounts" in b
-    assert "network" not in b["mounts"] and b["ports"] == ["8888/http", "7860/http"]
+    assert b["cloud"] == "SECURE" and b["startSsh"] is False and "env" not in b
+    assert b["ports"] == ["8888/http", "7860/http"] and b["name"] == NAME
+    with pytest.raises(podapi.PodApiError):
+        podapi.build_create_body(name="my-pod", gpu_id="g")  # names must be the unique, searchable kind
 
 
-def test_cost_estimate_matches_plan_numbers():
-    assert podapi.estimate_cost(1.59, 2) == pytest.approx(3.2078, abs=1e-3)  # plan: ~$3.21
-    assert podapi.estimate_cost(1.59, 2, volume_stopped_hours=10) > 3.2078
+def test_trial_names_are_unique_and_match_pattern():
+    names = {podapi.make_trial_name() for _ in range(50)}
+    assert len(names) == 50 and all(podapi.NAME_RE.match(n) for n in names)
 
 
-def test_create_is_guarded():
-    body = podapi.build_create_body(name="n", gpu_id="g")
-    api, s = api_with()
+def test_session_estimate_includes_runtime_to_stop_target_storage_after_stop_and_margin():
+    launch_at = __import__("datetime").datetime(2026, 10, 2, 14, 30, tzinfo=JST)
+    stop_at = __import__("datetime").datetime(2026, 10, 2, 16, 45, tzinfo=JST)
+    e = podapi.estimate_session(1.59, launch_at, stop_at, stop_lag_min=10, hold_hours_after_stop=24, margin=0.20)
+    assert e["run_hours"] == pytest.approx(2.25 + 10 / 60, abs=1e-3)           # 14:30 → 16:45 plus the stop lag
+    assert e["gpu_usd"] == pytest.approx(1.59 * e["run_hours"], abs=1e-3)
+    assert e["storage_after_stop_usd"] == pytest.approx(80 * 0.20 * 24 / 720, abs=1e-3)   # Pod Volume kept after stop
+    assert e["total_usd"] == pytest.approx(e["subtotal_usd"] * 1.2, abs=1e-3)           # margin on top
+    assert "保証するものではありません" in e["disclaimer"] and "自動停止" in e["disclaimer"]
+    longer = podapi.estimate_session(1.59, launch_at, stop_at, hold_hours_after_stop=72)
+    assert longer["total_usd"] > e["total_usd"]
+    with pytest.raises(podapi.PodApiError):
+        podapi.estimate_session(1.59, stop_at, launch_at)
+
+
+def test_plan_numbers_still_match_the_operations_plan():
+    assert podapi.estimate_cost(1.59, 2) == pytest.approx(3.2078, abs=1e-3)
+
+
+def test_create_is_guarded_and_estimate_is_not_called_a_cap():
+    body = podapi.build_create_body(name=NAME, gpu_id="g")
+    api, s = api_with(FakeResp(201, {"id": "x"}))
     with pytest.raises(podapi.PodApiError, match="not approved"):
-        api.create_pod(body, approval="yes", price_per_hr=1.59, hours=2)
-    with pytest.raises(podapi.PodApiError, match="exceeds budget"):
-        api.create_pod(body, approval=podapi.APPROVAL, price_per_hr=1.59, hours=6.5, budget_usd=10)
+        api.create_pod(body, approval="yes", estimate=est())
+    with pytest.raises(podapi.PodApiError, match="not a spending cap"):
+        api.create_pod(body, approval=podapi.APPROVAL, estimate=est(10.5), limit_usd=10)
     assert s.calls == []  # nothing was sent
 
 
 def test_create_returns_only_allowlisted_fields():
     api, s = api_with(FakeResp(201, {"id": "abc123xyz", "status": "PROVISIONING", "env": {"JUPYTER_PASSWORD": "s3cr3t"},
-                                      "ssh": {"x": 1}, "cost": 1.59, "name": "n"}))
-    out = api.create_pod(podapi.build_create_body(name="n", gpu_id="g"), approval=podapi.APPROVAL, price_per_hr=1.59, hours=2)
+                                      "ssh": {"x": 1}, "cost": 1.59, "name": NAME}))
+    out = api.create_pod(podapi.build_create_body(name=NAME, gpu_id="g"), approval=podapi.APPROVAL, estimate=est())
     assert "env" not in out and "ssh" not in out and out["id"] == "abc123xyz"
     assert s.calls[0][0] == "POST" and s.calls[0][1].endswith("/v2/pods")
 
 
-def test_stop_posts_action_then_reads_back_exited():
-    api, s = api_with(FakeResp(200, {"status": "STARTING"}),
-                      FakeResp(200, {"id": "abc123", "status": "RUNNING", "cost": 1.59}),
-                      FakeResp(200, {"id": "abc123", "status": "EXITED", "cost": 0.0, "actions": ["start", "terminate"]}))
-    out = api.stop_and_confirm("abc123", sleep=lambda _: None)
-    assert out["status"] == "EXITED"
-    assert s.calls[0][0] == "POST" and s.calls[0][1].endswith("/v2/pods/abc123/action") and s.calls[0][2]["json"] == {"action": "stop"}
-    assert [c[0] for c in s.calls[1:]] == ["GET", "GET"]
-
-
-def test_stop_failure_gives_console_instructions_and_never_terminates():
-    api, s = api_with(FakeResp(409, {"error": "x"}))
-    with pytest.raises(podapi.StopFailed) as ei:
-        api.stop_and_confirm("abc123")
+@pytest.mark.parametrize("failure", [TimeoutError("t"), ConnectionError("c"), FakeResp(502, {"e": 1}), FakeResp(504)])
+def test_create_timeout_or_5xx_is_reported_as_possibly_billed_and_never_retried(failure):
+    api, s = api_with(failure)
+    with pytest.raises(podapi.CreateUncertain) as ei:
+        api.create_pod(podapi.build_create_body(name=NAME, gpu_id="g"), approval=podapi.APPROVAL, estimate=est())
     msg = str(ei.value)
-    assert "abc123" in msg and "Stop (not Terminate)" in msg
-    assert not any("terminate" in str(c) for c in s.calls)
-    clock = iter([0, 5, 400, 400, 400])
-    api, s = api_with(FakeResp(200, {}), FakeResp(200, {"id": "abc123", "status": "RUNNING", "cost": 1.59}),
-                      FakeResp(200, {"id": "abc123", "status": "RUNNING", "cost": 1.59}))
-    with pytest.raises(podapi.StopFailed):
-        api.stop_and_confirm("abc123", timeout_s=300, sleep=lambda _: None, clock=lambda: next(clock))
+    assert "MAY have been created" in msg and NAME in msg and "console" in msg and "scripts/pod.py find" in msg
+    assert "Do NOT run create again" in msg
+    assert len(s.calls) == 1  # exactly one attempt
+
+
+def test_create_4xx_is_a_definite_failure_not_uncertain():
+    api, _s = api_with(FakeResp(402, {"error": "balance"}))
+    with pytest.raises(podapi.PodApiError) as ei:
+        api.create_pod(podapi.build_create_body(name=NAME, gpu_id="g"), approval=podapi.APPROVAL, estimate=est())
+    assert not isinstance(ei.value, podapi.CreateUncertain) and "not created" in str(ei.value)
+
+
+def test_find_pods_by_name_is_exact_paged_and_allowlisted():
+    page1 = {"pods": [{"id": "p1", "name": NAME + "x", "status": "RUNNING"}],
+             "pagination": {"hasNextPage": True, "nextCursor": "c2"}}
+    page2 = {"pods": [{"id": "p2", "name": NAME, "status": "RUNNING", "env": {"A": "b"}, "cost": 1.59}],
+             "pagination": {"hasNextPage": False, "nextCursor": None}}
+    api, s = api_with(FakeResp(200, page1), FakeResp(200, page2))
+    found = api.find_pods_by_name(NAME)
+    assert [p["id"] for p in found] == ["p2"] and "env" not in found[0]
+    assert s.calls[1][2]["params"]["cursor"] == "c2" and all(c[0] == "GET" for c in s.calls)
+
+
+def run_stop(responses, **kw):
+    api, s = api_with(*responses)
+    clock = FakeClock()
+    try:
+        return api.stop_and_confirm("abc123", sleep=clock.sleep, clock=clock.now, **kw), s, clock
+    except podapi.StopFailed as exc:
+        return exc, s, clock
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+def pod(status, **extra):
+    return FakeResp(200, {"id": "abc123", "status": status, **extra})
+
+
+def test_stop_confirms_only_exited_with_numeric_zero_cost():
+    out, s, _ = run_stop([FakeResp(200, {"status": "STARTING"}), pod("RUNNING", cost=1.59), pod("EXITED", cost=0.0)])
+    assert not isinstance(out, Exception) and out["status"] == "EXITED"
+    assert s.calls[0][0] == "POST" and s.calls[0][1].endswith("/v2/pods/abc123/action") and s.calls[0][2]["json"] == {"action": "stop"}
+    out, _, _ = run_stop([FakeResp(200, {}), pod("EXITED", cost=0)])  # integer 0 is fine
+    assert not isinstance(out, Exception)
+
+
+@pytest.mark.parametrize("cost_fields", [{}, {"cost": None}, {"cost": False}, {"cost": "0"}, {"cost": 0.01}, {"cost": 1.59}])
+def test_stop_does_not_treat_missing_null_or_nonzero_cost_as_zero(cost_fields):
+    out, _s, clock = run_stop([FakeResp(200, {}), pod("EXITED", **cost_fields)], timeout_s=60, interval_s=10)
+    assert isinstance(out, podapi.StopFailed)
+    assert clock.t >= 60  # it kept reading back until the deadline
+
+
+def test_stop_survives_communication_errors_until_the_deadline():
+    # POST times out, GET errors, then everything works before the deadline -> confirmed
+    out, s, _ = run_stop([TimeoutError("x"), ConnectionError("y"), FakeResp(200, {}), pod("RUNNING", cost=1.59),
+                          pod("EXITED", cost=0.0)], timeout_s=300, interval_s=10)
+    assert not isinstance(out, Exception)
+    # permanent errors: loop runs to the deadline, then fails with instructions
+    out, s, clock = run_stop([ConnectionError("down")], timeout_s=300, interval_s=10)
+    assert isinstance(out, podapi.StopFailed) and clock.t >= 300 and len(s.calls) > 5
+
+
+def test_stop_failure_always_has_pod_id_console_steps_and_never_terminates():
+    for responses in ([FakeResp(409, {"e": 1})], [ConnectionError("down")], [FakeResp(200, {}), pod("RUNNING", cost=1.59)]):
+        out, s, _ = run_stop(responses, timeout_s=30, interval_s=10)
+        msg = str(out)
+        assert isinstance(out, podapi.StopFailed)
+        assert "abc123" in msg and "Stop (not Terminate)" in msg and "console/pods" in msg and "Billing may still be running" in msg
+        assert not any(c[2].get("json") == {"action": "terminate"} for c in s.calls)
+
+
+def test_stop_cli_prints_instructions_on_failure(capsys, monkeypatch):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import pod as pod_cli
+    api, _ = api_with(ConnectionError("down"))
+    monkeypatch.setattr(podapi.time, "sleep", lambda _: None)
+    ticks = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(podapi.time, "monotonic", lambda: next(ticks))
+    assert pod_cli.main(["stop", "abc123"], api=api) == 2
+    err = capsys.readouterr().err
+    assert "abc123" in err and "Stop (not Terminate)" in err
+
+
+def test_cli_create_requires_the_planned_name_and_reports_uncertain_create(capsys):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import pod as pod_cli
+
+    class Api:
+        def gpu_availability(self, g):
+            return {"id": g, "secure_price_per_hr": 1.59, "availability": "MEDIUM", "max_count": 8}
+
+        def datacenters_with_gpu(self, g):
+            return [{"id": "US-MD-1", "availability": "MEDIUM"}]
+
+        def create_pod(self, body, **kw):
+            raise podapi.CreateUncertain(body["name"], "TimeoutError")
+    now = __import__("datetime").datetime(2026, 10, 2, 14, 0, tzinfo=JST)
+    assert pod_cli.main(["create", "--approve", podapi.APPROVAL], api=Api(), now=now) == 2          # no --name
+    code = pod_cli.main(["create", "--approve", podapi.APPROVAL, "--name", NAME, "--launch-at", "14:30"], api=Api(), now=now)
+    cap = capsys.readouterr()
+    assert code == 3 and NAME in cap.err and "MAY have been created" in cap.err
+
+
+def test_cli_plan_prints_estimate_breakdown_and_limit(capsys):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import pod as pod_cli
+
+    class Api:
+        def gpu_availability(self, g):
+            return {"id": g, "secure_price_per_hr": 1.59, "availability": "LOW" if "PCIe" in g else "MEDIUM", "max_count": 8}
+
+        def datacenters_with_gpu(self, g):
+            return [{"id": "US-MD-1", "availability": "MEDIUM"}]
+    now = __import__("datetime").datetime(2026, 10, 2, 14, 0, tzinfo=JST)
+    assert pod_cli.main(["plan", "--launch-at", "14:30"], api=Api(), now=now) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["body"]["gpu"]["id"] == "NVIDIA A100-SXM4-80GB"  # better stock wins
+    e = out["estimate"]
+    assert {"run_hours", "gpu_usd", "storage_running_usd", "storage_after_stop_usd", "margin_pct", "total_usd"} <= set(e)
+    assert out["within_limit"] is True and podapi.NAME_RE.match(out["body"]["name"])
 
 
 def test_pod_id_is_validated():
-    api, _ = api_with()
+    api, _ = api_with(FakeResp(200, {}))
     for bad in ("", "../x", "a b", "x" * 50):
         with pytest.raises(podapi.PodApiError):
             api.stop_pod(bad)
 
 
 def test_no_terminate_or_delete_in_podapi():
-    tree = ast.parse((PKG / "podapi.py").read_text())
+    src = (PKG / "podapi.py").read_text()
+    tree = ast.parse(src)
     assert not [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and re.search("terminate|delete", n.name)]
-    assert '"DELETE"' not in (PKG / "podapi.py").read_text() and '"terminate"' not in (PKG / "podapi.py").read_text().replace("no terminate", "")
+    assert '"DELETE"' not in src and '{"action": "terminate"}' not in src
 
 
 def test_no_key_handling_in_code():
     for f in list(PKG.glob("*.py")) + [ROOT / "scripts" / "pod.py"]:
-        code = "\n".join(l for l in f.read_text().splitlines() if not l.lstrip().startswith(("#", '"""')))
+        code = "\n".join(line for line in f.read_text().splitlines() if not line.lstrip().startswith(("#", '"""')))
         assert "RUNPOD_API_KEY" not in code, f
         assert not re.search(r"headers\s*=|Bearer|os\.environ\[.*KEY", code) or f.name == "report.py", f
 
@@ -386,3 +537,197 @@ def test_llama_install_refuses_guessing_arch_or_missing_nvcc(tmp_path, monkeypat
     monkeypatch.setattr(colab, "detect_cuda_arch", lambda: None)
     with pytest.raises(RuntimeError, match="compute capability"):
         llama.install(tmp_path, run=lambda c: None)
+
+
+# ---------------------------------------------------------------- notebook root resolution
+def _notebook_cell(index_contains: str) -> str:
+    nb = json.loads((ROOT / "notebooks" / "Qwen-Q8-Chat-RunPod.ipynb").read_text())
+    return next("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code" and index_contains in "".join(c["source"]))
+
+
+@pytest.mark.parametrize("start", ["notebooks", "."])
+def test_cell1_resolves_repo_root_from_notebooks_folder_or_root(start, tmp_path):
+    cell = _notebook_cell("Cell 1")
+    resolver = cell.split("# --- end root resolution ---")[0]
+    code = resolver + "\nprint(REPO_DIR)\n"
+    env = {k: v for k, v in __import__("os").environ.items() if k != "QMC_REPO_ROOT"}
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT / start, capture_output=True, text=True, env=env, check=True)
+    assert Path(out.stdout.strip()) == ROOT
+    # outside the repo it fails clearly instead of picking something else
+    bad = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, capture_output=True, text=True, env=env, check=False)
+    assert bad.returncode != 0 and "repository root not found" in bad.stderr
+    # explicit override works from anywhere
+    env["QMC_REPO_ROOT"] = str(ROOT)
+    ok = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, capture_output=True, text=True, env=env, check=True)
+    assert Path(ok.stdout.strip()) == ROOT
+
+
+def test_notebook_uses_repo_dir_not_cwd_after_resolution():
+    nb = json.loads((ROOT / "notebooks" / "Qwen-Q8-Chat-RunPod.ipynb").read_text())
+    later = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code" and "Cell 1" not in "".join(c["source"]))
+    assert "os.getcwd" not in later and "Path.cwd" not in later and "%cd" not in later
+    cell1_after = _notebook_cell("Cell 1").split("# --- end root resolution ---")[1]
+    assert "getcwd" not in cell1_after and "REPO_DIR" in cell1_after
+
+
+def test_first_check_is_one_capped_request_and_perf_criteria_default_to_skipped():
+    first = _notebook_cell("Cell 4:")
+    assert first.count("smoke.first_response") == 1 and "warm_runs" not in first
+    assert "64 tokens" in first or "64" in first
+    warm = _notebook_cell("Cell 4b")
+    assert "evaluate_criteria" in warm and "OPTIONAL" in warm
+    rep = report.checks_template()
+    assert set(rep.values()) == {"skipped"} and "perf_criteria" in rep and "warm_runs" in rep
+
+
+# ---------------------------------------------------------------- bootstrap script (public repo, pinned commit)
+def test_bootstrap_checks_out_exact_commit_and_rejects_bad_input(tmp_path):
+    src = tmp_path / "src"
+    subprocess.run(["git", "init", "-q", str(src)], check=True)
+    for i in range(2):
+        (src / "f.txt").write_text(str(i))
+        subprocess.run(["git", "-C", str(src), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", str(i)], check=True)
+    shas = subprocess.run(["git", "-C", str(src), "rev-list", "HEAD"], capture_output=True, text=True, check=True).stdout.split()
+    env = {**__import__("os").environ, "QMC_OPS_REPO_URL": str(src), "QMC_OPS_DIR": str(tmp_path / "ops")}
+    script = str(ROOT / "scripts" / "pod-bootstrap.sh")
+    assert subprocess.run(["bash", script, "main"], env=env, capture_output=True, check=False).returncode == 2  # branch names refused
+    assert subprocess.run(["bash", script, shas[1]], env=env, capture_output=True, check=False).returncode == 0
+    head = subprocess.run(["git", "-C", str(tmp_path / "ops"), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    assert head == shas[1]  # the older, pinned commit, not the branch tip
+    (tmp_path / "ops" / "f.txt").write_text("dirty")
+    assert subprocess.run(["bash", script, shas[1]], env=env, capture_output=True, check=False).returncode != 0  # dirty tree refused
+
+
+# ---------------------------------------------------------------- provenance and report contents
+def _git_repo(path):
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "requirements-runpod.lock.txt").write_text("gradio==6.29.0\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"], check=True)
+
+
+def test_build_report_records_commit_lock_hash_image_cuda_build_and_all_checks(tmp_path):
+    import hashlib
+
+    from qmc_runpod import provenance, trial
+    _git_repo(tmp_path)
+    checks = report.checks_template()
+    report.mark(checks, "upstream_pin", True)
+    report.mark(checks, "app_launch", False)
+    rep = trial.build_report(
+        trial_id="t1", repo_root=tmp_path, lock_path=tmp_path / "requirements-runpod.lock.txt",
+        model_records=[{"role": "chat", "file": "a.gguf", "revision": "r", "sha256_verified": True, "size_bytes": 1}],
+        settings={"ctx": 8192, "thinking": False}, gpu={"gpu_name": "A100", "total_mib": 81920, "driver": "550"},
+        build={"cuda_archs": "80", "runtime_tag": "py311-x86_64", "build_type": "Release", "build_seconds": 1500.0,
+               "built_this_run": True},
+        checks=checks, server_version="llama-server 1")
+    assert report.validate(rep) == []
+    assert rep["source"]["ops_commit"] == provenance.git_head(tmp_path) and rep["source"]["ops_tree_clean"] is True
+    assert rep["source"]["lock_sha256"] == hashlib.sha256(b"gradio==6.29.0\n").hexdigest()
+    assert rep["environment"]["image_tag"].startswith("runpod/pytorch:") and "image_digest" in rep["environment"]
+    assert {"cuda_toolkit", "cuda_driver_api"} <= set(rep["environment"])
+    assert rep["llama_cpp"]["cuda_archs"] == "80" and rep["llama_cpp"]["build_seconds"] == 1500.0
+    assert rep["checks"]["upstream_pin"] == "pass" and rep["checks"]["app_launch"] == "fail" and rep["checks"]["asr"] == "skipped"
+    (tmp_path / "dirty.txt").write_text("x")
+    assert provenance.tree_clean(tmp_path) is False
+
+
+def test_report_requires_every_check_and_only_pass_fail_skipped():
+    rep = good_report()
+    del rep["checks"]["asr"]
+    assert any("asr" in e and "missing" in e for e in report.validate(rep))
+    rep = good_report(); rep["checks"]["asr"] = "ok"
+    assert report.validate(rep)
+    rep = good_report(); rep["checks"]["made_up"] = "pass"
+    assert any("not a known check" in e for e in report.validate(rep))
+    rep = good_report(); del rep["checks"]
+    assert report.validate(rep)
+
+
+def test_pod_section_drops_env_ssh_and_everything_not_named():
+    from qmc_runpod import trial
+    summary = {"id": "abc123", "gpu_id": "NVIDIA A100-SXM4-80GB", "dataCenterId": "US-MD-1", "status": "EXITED",
+               "env": {"JUPYTER_PASSWORD": "s3cr3t", "PUBLIC_KEY": "ssh-rsa AAA"}, "ssh": {"ip": "1.2.3.4"},
+               "runtime": {"x": 1}, "name": NAME}
+    sec = trial.pod_section(summary, price_per_hr=1.59)
+    assert set(sec) <= {"id", "gpu_type", "data_center", "started_at", "final_status", "price_per_hr"}
+    assert "s3cr3t" not in json.dumps(sec) and "ssh-rsa" not in json.dumps(sec)
+    rep = good_report(); rep["pod"] = sec
+    assert report.validate(rep) == []
+    rep["pod"] = {**sec, "env": {"A": "b"}}
+    assert report.validate(rep)
+
+
+# ---------------------------------------------------------------- cold / warm separation and output cap
+class RecordingChat:
+    name = "chat"
+
+    def __init__(self, deltas=5):
+        self.params, self.loaded, self.deltas = [], False, deltas
+
+    @property
+    def is_loaded(self):
+        return self.loaded
+
+    def stream_chat(self, messages, params, cancel=None):
+        from qmc.backends.base import ChatDelta
+        self.params.append(params)
+        for i in range(self.deltas):
+            yield ChatDelta(content="x", finish_reason="length" if i == self.deltas - 1 else None)
+
+
+class StubManager:
+    def __init__(self, model):
+        self.model = model
+
+    def ensure(self, name):
+        self.model.loaded = True
+
+    def get(self, name):
+        return self.model
+
+    def is_loaded(self, name):
+        return self.model.loaded
+
+
+class StubApp:
+    def __init__(self, model):
+        self.manager = StubManager(model)
+
+
+@needs_upstream
+def test_first_response_is_one_request_with_explicit_output_cap_after_separate_load():
+    from qmc_runpod import smoke
+    model = RecordingChat()
+    app = StubApp(model)
+    with pytest.raises(RuntimeError, match="not loaded"):
+        smoke.first_response(app)  # load time must never be counted as a request
+    load = smoke.load_model(app)
+    first = smoke.first_response(app)
+    assert set(load) == {"load_s"} and len(model.params) == 1
+    assert model.params[0].max_tokens == smoke.FIRST_MAX_TOKENS == 64 and first["max_tokens"] == 64
+    assert first["phase"] == "first" and first["finish_reason"] == "length" and first["stream_deltas"] == 5
+
+
+@needs_upstream
+def test_warm_runs_use_256_cap_and_criteria_need_ten_clean_warm_runs():
+    from qmc_runpod import smoke
+    model = RecordingChat()
+    app = StubApp(model)
+    smoke.load_model(app)
+    first = smoke.first_response(app)
+    five = smoke.warm_runs(app, ["a"] * 5)
+    assert all(p.max_tokens == 256 for p in model.params[1:])
+    assert smoke.evaluate_criteria(five)["verdict"] == "not_evaluated"
+    assert smoke.evaluate_criteria([first])["verdict"] == "not_evaluated"        # the cold request never counts
+    assert smoke.evaluate_criteria([])["verdict"] == "not_evaluated"
+    ten = smoke.warm_runs(app, ["a"] * 10)
+    verdict = smoke.evaluate_criteria(ten)
+    assert verdict["verdict"] in ("pass", "fail") and "not a guarantee" in verdict["note"]
+    short_cap = smoke.warm_runs(app, ["a"] * 10, max_tokens=64)
+    assert smoke.evaluate_criteria(short_cap)["verdict"] == "not_evaluated"      # wrong cap is not comparable
+    slow = [{**r, "total_s": 99.0} for r in ten]
+    assert smoke.evaluate_criteria(slow)["verdict"] == "fail"
+    errs = [{**r, "error": True} for r in ten]
+    assert smoke.evaluate_criteria(errs)["verdict"] == "not_evaluated"
