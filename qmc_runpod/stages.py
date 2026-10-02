@@ -50,7 +50,7 @@ class StageError(RuntimeError):
 
 
 class Runner:
-    def __init__(self, root: Path | None = None, mirror: Path | None | bool = True):
+    def __init__(self, root: Path | None = None, mirror: Path | None | bool = True, run_id: str | None = None):
         self.p = layout.paths(root)
         self.root = self.p["root"]
         self.runs = self.p["runs"]
@@ -63,6 +63,7 @@ class Runner:
             mirror = None if override == "off" else (Path(override) if override else MIRROR_PATH)
         self.mirror = mirror or None
         self._last_mirror = 0.0
+        self.run_id = run_id
 
     # ---- logging
     def _mirror(self, line: str) -> None:
@@ -75,13 +76,13 @@ class Runner:
             pass
 
     def event(self, stage: str, message: str) -> None:
-        line = logchannel.event_line(stage, message)
+        line = logchannel.event_line(stage, message, run_id=self.run_id)
         with open(self.logs / f"{stage}.log", "a", encoding="utf-8") as f:
             f.write(line + "\n")
         self._mirror(line)
 
     def emit_artifact(self, path: Path, name: str | None = None) -> None:
-        for line in logchannel.encode_artifact(path, name):
+        for line in logchannel.encode_artifact(path, name, run_id=self.run_id):
             self._mirror(line)
         self.event("emit", f"artifact {name or Path(path).name} sent to log stream")
 
@@ -262,8 +263,17 @@ def stage_venv(r: Runner, lock: Path, *, python: str | None = None, kernel_prefi
         r.set_status("venv", "fail", reason="pip check failed inside the venv")
         raise StageError("pip check failed inside the isolated venv")
     if register_kernel:
-        r.run("venv", envsetup.kernel_cmd(r.root, kernel_prefix), env=env, check=False)
-    r.set_status("venv", "ok", kernel=envsetup.KERNEL_NAME)
+        rc = r.run("venv", envsetup.kernel_cmd(r.root, kernel_prefix), env=env, check=False)
+        r.mark("kernel_registered", False)
+        if rc != 0:
+            raise StageError(f"kernel registration failed with exit code {rc}")
+        r.run("venv", [str(envsetup.venv_python(r.root)), "-c",
+              "import pathlib,sys;from jupyter_client.kernelspec import KernelSpecManager;"
+              f"s=KernelSpecManager({('kernel_dirs=' + repr([str(kernel_prefix / 'share/jupyter/kernels')])) if kernel_prefix else ''}).get_kernel_spec({envsetup.KERNEL_NAME!r});"
+              "assert pathlib.Path(s.argv[0]).resolve()==pathlib.Path(sys.executable).resolve();"
+              "print('kernelspec interpreter verified')"], env=env)
+        r.mark("kernel_registered", True)
+    r.set_status("venv", "ok", kernel=envsetup.KERNEL_NAME if register_kernel else "not_registered")
 
 
 def stage_build(r: Runner, *, run_llama=None, fetch=None) -> None:
@@ -279,8 +289,13 @@ def stage_build(r: Runner, *, run_llama=None, fetch=None) -> None:
              "build_type": "Release", "build_seconds": round(time.monotonic() - t0, 1), "built_this_run": not existing}
     r.mark("llama_built", server.exists())
     r.event("build", "llama-server ready; fetching pinned models")
+    t0 = time.monotonic()
     paths, records = (fetch or (lambda: models.fetch_pinned(r.p["hf_cache"])))()
-    r.mark("models_verified", all(x["sha256_verified"] for x in records))
+    build["download_seconds"] = round(time.monotonic() - t0, 1)
+    verified = len(records) == 2 and {x["role"] for x in records} == {"chat", "mmproj"} and all(x["sha256_verified"] for x in records)
+    r.mark("models_verified", verified)
+    if not server.exists() or not verified:
+        raise StageError("CUDA server or complete model verification missing")
     (r.runs / "build.json").write_text(json.dumps({
         "server": str(server), "build": build, "records": records, "model_paths": [str(p) if p else None for p in paths]}))
     r.set_status("build", "ok", build_seconds=build["build_seconds"])
@@ -299,7 +314,9 @@ def write_login(root: Path, user: str, password: str) -> Path:
 
 
 def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: float = 0,
-                host: str | None = None, port: int | None = None, trial_id: str | None = None) -> Path:
+                host: str | None = None, port: int | None = None, trial_id: str | None = None,
+                full_features: bool = False, allow_search: bool = False, audio: Path | None = None,
+                transcript: str | None = None, test_deadline: float | None = None) -> Path:
     """Launch the chat-only app, one capped smoke request, optional warm runs, then report + bundle."""
     import datetime
 
@@ -345,30 +362,53 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
             prompts = ["日本の四季を50字で説明して。", "1から10までの和は？", "Pythonでリストを逆順にする方法は？",
                        "富士山の高さは？", "挨拶を一言。", "Gitのcommitとpushの違いは？",
                        "味噌汁の基本の作り方を3行で。", "TCPとUDPの違いを一言で。", "今日の気分を一言で。", "素数とは？"]
-            runs = smoke.warm_runs(app, prompts)
+            runs = smoke.warm_runs(app, prompts, on_sample=lambda rows: r._write(r.runs / "warm-samples.json", {"samples": rows}))
             summary = smoke.summarize(runs)
             crit = smoke.evaluate_criteria(runs)
             report.mark(checks, "warm_runs", summary["ok_runs"] == len(prompts))
             report.mark(checks, "perf_criteria", None if crit["verdict"] == "not_evaluated" else crit["verdict"] == "pass")
             metrics.update({"warm_" + k: v for k, v in summary.items()})
+            metrics["warm_samples"] = runs
+        from . import features
+        # UI observation belongs to the 8k baseline, before the explicit 32k reload.
         deadline = time.monotonic() + hold_min * 60
-        while time.monotonic() < deadline:  # keep the UI up so the owner can log in and try it
-            r.event("trial", f"holding UI; {int(deadline - time.monotonic())}s left")
-            time.sleep(min(60, max(1, deadline - time.monotonic())))
+        while time.monotonic() < deadline and not (r.root / "ui-check.json").exists():
+            if (r.root / "CANCEL").exists() or (test_deadline is not None and time.time() >= test_deadline):
+                break
+            r.event("trial", f"8k UI observation window; {int(deadline - time.monotonic())}s left")
+            time.sleep(min(5, max(.1, deadline - time.monotonic())))
+        feature_results = features.template()
+        if full_features and not mock and checks["first_response"] == "pass" and checks["auth_enforced"] == "pass":
+            feature_results = features.run(app, r.root / "fixtures", allow_search=allow_search,
+                                           audio=audio, transcript=transcript, deadline=test_deadline,
+                                           cancel=r.root / "CANCEL")
+        elif mock:
+            for row in feature_results.values():
+                row["reason"] = "CPU mock is not real feature evidence"
+        if not mock and r.run_id:
+            feature_results["ui_chat"] = features.ui_receipt(r.root / "ui-check.json", r.run_id)
+        for name, row in feature_results.items():
+            checks[name] = row["status"]
         rep = trial.build_report(
-            trial_id=trial_id or "t" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M"), repo_root=Path(__file__).resolve().parents[1],
+            trial_id=trial_id or r.run_id or "t" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M"), repo_root=Path(__file__).resolve().parents[1],
             lock_path=Path(__file__).resolve().parents[1] / "requirements-runpod.lock.txt", model_records=records, gpu=gpu,
             build=build, checks=checks, metrics=metrics, server_version=server_version, gradio_version=gradio.__version__,
             settings={"ctx": int(env["QMC_CHAT_CTX"]), "thinking": False, "web_search": "off", "asr_device": "cpu",
                       "asr_model": "small", "tts": False, "share": False, "chat_only": True},
             notes=["report_exported is confirmed outside the Pod after read-back", "perf criteria need 10 warm runs"]
             + (["CPU rehearsal with the mock backend"] if mock else []))
+        rep["execution_mode"] = "cpu_mock" if mock else "real_gpu"
+        rep["features"] = feature_results
         path = report.write_report(rep, r.runs)
         bundle = r.runs / (path.stem + ".tar.gz")
         report.make_bundle([path], bundle)
         r._write(r.checks_path, checks)
         r.emit_artifact(bundle)
-        r.set_status("trial", "ok", bundle=bundle.name)
+        failed = any(checks[name] == "fail" for name in ("auth_enforced", "first_response", "warm_runs"))
+        r.set_status("trial", "fail" if failed else "ok", bundle=bundle.name,
+                     feature_coverage="partial" if any(row["status"] == "skipped" for row in feature_results.values()) else "attempted")
+        if failed:
+            raise StageError("trial acceptance failed; diagnostic bundle was emitted")
         return bundle
     finally:
         launch.stop_app(app)

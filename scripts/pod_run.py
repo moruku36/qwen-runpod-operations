@@ -73,12 +73,18 @@ def main(argv=None):
     ap.add_argument("stage", choices=[*stages.STAGES, "all", "status", "emit"])
     ap.add_argument("file", nargs="?")
     ap.add_argument("--root", type=Path, default=None)
+    ap.add_argument("--run-id", default=None)
+    ap.add_argument("--features", action="store_true")
+    ap.add_argument("--allow-public-search", action="store_true")
+    ap.add_argument("--audio", type=Path)
+    ap.add_argument("--transcript-file", type=Path)
+    ap.add_argument("--test-deadline", type=float)
     ap.add_argument("--bg", action="store_true")
     ap.add_argument("--warm", action="store_true")
     ap.add_argument("--hold-min", type=float, default=0)
     ap.add_argument("--mock", action="store_true", help="CPU rehearsal with the mock backend (no model, no GPU)")
     a = ap.parse_args(argv)
-    r = stages.Runner(a.root)
+    r = stages.Runner(a.root, run_id=a.run_id)
     if a.bg:
         rest = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--bg"]
         logf = open(r.logs / f"{a.stage}.bg.log", "a")  # noqa: SIM115
@@ -111,7 +117,10 @@ def main(argv=None):
         elif a.stage == "build":
             stages.stage_build(r)
         elif a.stage == "trial":
-            stages.stage_trial(r, mock=a.mock, warm=a.warm, hold_min=a.hold_min)
+            stages.stage_trial(r, mock=a.mock, warm=a.warm, hold_min=a.hold_min,
+                               full_features=a.features, allow_search=a.allow_public_search, audio=a.audio,
+                               transcript=a.transcript_file.read_text(encoding="utf-8").strip() if a.transcript_file else None,
+                               test_deadline=a.test_deadline)
     except Exception as exc:  # noqa: BLE001
         r.set_status(a.stage, "fail", error=type(exc).__name__, message=str(exc)[:200])
         print(f"{a.stage} failed: {exc}", file=sys.stderr)

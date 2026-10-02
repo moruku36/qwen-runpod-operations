@@ -16,6 +16,9 @@ hf-cache/
 models/
 .venv/
 venv/
+cpu-venv/
+.pytest_cache/
+cpu-evidence/
 data/
 runs/
 *.db

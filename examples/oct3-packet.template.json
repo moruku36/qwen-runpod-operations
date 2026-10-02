@@ -1,0 +1,22 @@
+{
+  "run_id": "REPLACE-FRESH-RUN-ID",
+  "commit": "REPLACE-WITH-FINAL-40-HEX-COMMIT",
+  "root": "/workspace/oct3-REPLACE-FRESH-RUN-ID",
+  "stages": ["selftest", "net", "source", "venv", "build", "trial"],
+  "allocated_at": "REPLACE-ACTUAL-ALLOCATION-TIME-WITH-OFFSET",
+  "test_deadline": "REPLACE-EARLIER-OF-BUDGET-DEADLINE-OR-T-PLUS-100-MIN",
+  "stop_deadline": "REPLACE-VERIFY-STOP-BY-EARLIER-OF-BUDGET-OR-T-PLUS-120-MIN",
+  "approval_date": "2026-10-03",
+  "cap_usd": 10,
+  "quote_total_usd": null,
+  "export_destination": "REPLACE-PRIVATE-OFF-POD-DESTINATION",
+  "lock_sha256": "d9fb03b78fed58478ebe7e67023d93d331e5b9b8ffcba613f267d4599efdc8d0",
+  "feature_options": {
+    "allow_public_search": true,
+    "audio": "REPLACE-ABSOLUTE-LICENSED-WAV-PATH",
+    "audio_sha256": "REPLACE-SPEECH-FIXTURE-SHA256",
+    "transcript_file": "REPLACE-ABSOLUTE-KNOWN-TRANSCRIPT-PATH",
+    "transcript_sha256": "REPLACE-TRANSCRIPT-SHA256",
+    "licensed_audio": false
+  }
+}

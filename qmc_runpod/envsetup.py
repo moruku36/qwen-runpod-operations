@@ -9,6 +9,7 @@ the workspace, created without system site-packages, installed from the hash-loc
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 from . import layout
@@ -25,7 +26,7 @@ def venv_dir(root: Path | None = None) -> Path:
 
 
 def venv_python(root: Path | None = None) -> Path:
-    return venv_dir(root) / "bin" / "python"
+    return venv_dir(root) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 def create_cmd(root: Path | None = None, python: str | None = None, *, without_pip: bool = False) -> list[str]:

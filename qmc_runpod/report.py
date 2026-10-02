@@ -23,7 +23,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 CHECK_NAMES = (
     "upstream_pin", "ops_commit_clean", "lock_installed", "llama_built", "models_verified", "app_launch",
     "auth_enforced", "first_response", "warm_runs", "perf_criteria", "image_understanding", "web_search", "asr",
-    "ctx_32k", "history_restore", "release_reload", "report_exported",
+    "ctx_32k", "history_restore", "release_reload", "report_exported", "kernel_registered", "ui_chat",
 )
 CHECK_VALUES = ("pass", "fail", "skipped")
 
@@ -33,7 +33,7 @@ SCHEMA = {
     "source": {"ops_commit": "str", "ops_tree_clean": "bool", "lock_sha256": "str"},
     "upstream": {"sha": "str", "notebook_blob": "str"},
     "llama_cpp": {"commit": "str", "version_line": "str", "cuda_archs": "str", "runtime_tag": "str",
-                  "build_type": "str", "build_seconds": "num", "built_this_run": "bool"},
+                  "build_type": "str", "build_seconds": "num", "download_seconds": "num", "built_this_run": "bool"},
     "models": [{"role": "str", "file": "str", "revision": "str", "sha256_verified": "bool", "size_bytes": "num"}],
     "environment": {"gpu_name": "str", "vram_mib": "num", "driver": "str", "cuda_toolkit": "str",
                     "cuda_driver_api": "str", "python": "str", "gradio": "str", "image_tag": "str",
@@ -47,10 +47,17 @@ SCHEMA = {
             "started_at": "str", "stopped_at": "str", "final_status": "str"},
     "cost_usd": None,
     "notes": ["str"],
+    "execution_mode": "str",
+    "features": {name: {"status": "str", "reason": "str", "evidence": None,
+                        "urls": ["str"]} for name in ("ctx_32k", "image_understanding", "web_search", "asr", "history_restore", "ui_chat")},
 }
 
 
 def _scalar_ok(value, kind: str, path: str, errs: list[str]) -> None:
+    if kind == "nullable_num":
+        if value is None:
+            return
+        kind = "num"
     if kind == "bool":
         ok = isinstance(value, bool)
     elif kind == "num":
@@ -87,6 +94,11 @@ def _check(value, schema, path: str, errs: list[str]) -> None:
             errs.append(f"{path}: expected object")
             return
         for k, v in value.items():
+            if path == "report.metrics" and k == "warm_samples":
+                _check(v, [{"phase": "str", "first_delta_s": "nullable_num", "total_s": "num",
+                            "stream_deltas": "num", "finish_reason": "str", "max_tokens": "num", "error": "bool"}],
+                       path + ".warm_samples", errs)
+                continue
             if not KEY_RE.match(str(k)):
                 errs.append(f"{path}.{k}: bad key name")
             elif not isinstance(v, (bool, int, float)):
@@ -122,6 +134,16 @@ def validate(report: dict) -> list[str]:
         errs.append("report.checks: expected object")
     else:
         errs.append("report.checks: missing")
+    feature_rows = report.get("features", {})
+    for name, row in (feature_rows if isinstance(feature_rows, dict) else {}).items():
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") not in CHECK_VALUES:
+            errs.append(f"report.features.{name}: invalid status")
+        if row.get("status") == "pass" and not row.get("evidence"):
+            errs.append(f"report.features.{name}: pass needs evidence")
+        if isinstance(checks, dict) and checks.get(name) != row.get("status"):
+            errs.append(f"report.features.{name}: differs from check status")
     return errs
 
 
@@ -152,29 +174,60 @@ def make_bundle(files: list[Path], out_tar: Path) -> dict:
     return manifest
 
 
-def verify_bundle(tar_path: Path) -> list[str]:
+def verify_bundle(tar_path: Path, *, expected_run_id: str | None = None,
+                  required_checks: tuple[str, ...] = ()) -> list[str]:
     """Read-back check done after the bundle is stored outside the Pod. Returns a list of problems."""
     problems: list[str] = []
     try:
         tar = tarfile.open(tar_path, "r:gz")  # noqa: SIM115 - closed below
-    except (tarfile.ReadError, OSError):
+    except (tarfile.TarError, OSError, EOFError):
         return ["not a readable tar.gz"]
     with tar:
-        names = {m.name for m in tar.getmembers()}
+        try:
+            members = tar.getmembers()
+        except (tarfile.TarError, OSError, EOFError):
+            return ["incomplete tar members"]
+        names = {m.name for m in members}
+        if len(names) != len(members) or any(not m.isfile() or Path(m.name).name != m.name or "\\" in m.name
+                                           or m.size > 5_000_000 for m in members):
+            return ["duplicate, unsafe or oversized bundle member"]
         if "MANIFEST.json" not in names:
             return ["MANIFEST.json missing"]
-        manifest = json.load(tar.extractfile("MANIFEST.json"))
+        try:
+            manifest = json.load(tar.extractfile("MANIFEST.json"))
+            entries = manifest["files"]
+            if not entries or len({e["name"] for e in entries}) != len(entries):
+                return ["empty or duplicate manifest"]
+        except (ValueError, KeyError, TypeError):
+            return ["invalid manifest"]
         listed = {e["name"] for e in manifest["files"]}
         if names - {"MANIFEST.json"} != listed:
             problems.append("file list differs from manifest")
-        for e in manifest["files"]:
+        report_count = 0
+        for e in entries:
             member = tar.extractfile(e["name"]) if e["name"] in names else None
             if member is None:
                 problems.append(f"{e['name']}: missing")
                 continue
             data = member.read()
-            if len(data) != e["size"] or hashlib.sha256(data).hexdigest() != e["sha256"]:
+            if len(data) != e.get("size") or hashlib.sha256(data).hexdigest() != e.get("sha256"):
                 problems.append(f"{e['name']}: size/hash mismatch")
             elif e["name"].endswith(".json"):
-                problems += [f"{e['name']}: {x}" for x in validate(json.loads(data))]
+                try:
+                    rep = json.loads(data)
+                    problems += [f"{e['name']}: {x}" for x in validate(rep)]
+                    report_count += 1
+                    if expected_run_id is not None and rep.get("trial_id") != expected_run_id:
+                        problems.append("unexpected report run ID")
+                    for name in required_checks:
+                        if rep.get("checks", {}).get(name) != "pass":
+                            problems.append(f"required check not passed: {name}")
+                    if required_checks and rep.get("execution_mode") != "real_gpu":
+                        problems.append("CPU/mock report cannot satisfy real-run acceptance")
+                except (ValueError, TypeError, AttributeError):
+                    problems.append("invalid report JSON")
+            else:
+                problems.append("file not in report allowlist")
+        if report_count != 1:
+            problems.append("exactly one report required")
     return problems
