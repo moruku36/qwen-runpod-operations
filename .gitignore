@@ -1,0 +1,32 @@
+# Secrets and local state
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*credentials*
+
+# Model weights, caches, environments, user content
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.bin
+hf-cache/
+models/
+.venv/
+venv/
+data/
+runs/
+*.db
+*.db-*
+*.sqlite*
+*.log
+__pycache__/
+.ipynb_checkpoints/
+
+# Build and OS files
+build/
+dist/
+.DS_Store
+Thumbs.db

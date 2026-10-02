@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "checked_at_utc": "2026-10-02",
+  "status": "planning_only_no_gpu_run",
+  "upstream": {
+    "repository": "https://github.com/moruku36/qwen-multimodal-colab",
+    "commit": "9e5ff82cf604dd3b0377de81b89e1f4aaa422947",
+    "notebook": "Qwen-Q8-Chat-Colab.ipynb",
+    "notebook_git_blob": "5e40a89f0253356c9c8d72698a93508f4d30d8aa",
+    "merged_pr": 35,
+    "original_notebook_git_blob": "15836f710296a2d6bbc665bcddd169424716679d"
+  },
+  "runtime": {
+    "engine": "llama.cpp",
+    "commit": "4da6337767f973e2b4d0797e5b323d77d8565e4a",
+    "image_digest": null,
+    "python_lock": null,
+    "chat_only": true,
+    "server_host": "127.0.0.1",
+    "server_port": 8012,
+    "chat_context_baseline": 32768,
+    "chat_context_initial_smoke": 8192,
+    "thinking": false,
+    "asr_device": "cpu",
+    "asr_model": "small",
+    "share": false
+  },
+  "models": [
+    {
+      "role": "chat",
+      "repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+      "file": "Huihui-Qwen3.8-27B-abliterated-UD-DW-Q8_K_L.gguf",
+      "file_change_commit": "ff733b88376282017b7f4675d6d96536c6ffa712",
+      "size_display": "27.3 GB",
+      "sha256_publisher": "fb8413d0b5cec5ad7055e49630a986518ba90fdacc95a337aa535e8ff5bf0d16",
+      "download_verified": false,
+      "license_label": "apache-2.0"
+    },
+    {
+      "role": "vision_projector",
+      "repo": "ggml-org/Qwen3.8-27B-GGUF",
+      "file": "mmproj-Qwen3.8-27B-Q8_0.gguf",
+      "file_change_commit": "97c30c65c8d9a3e73f9fdfb50f1d1a669e9a2827",
+      "size_bytes": 629247008,
+      "sha256_publisher": "2e968a6af97ce35d8971890b257b9b7edabf20ad91450501fa53162a19ee33eb",
+      "download_verified": false,
+      "license_label": "apache-2.0"
+    }
+  ],
+  "notes": [
+    "Publisher metadata is not a local download verification.",
+    "File change commits are source-page references; implementation must pin and validate an appropriate immutable revision.",
+    "Template digest and dependency lock remain unset until implementation.",
+    "No billing, deployment, automatic stop or termination is authorized by this file."
+  ]
+}
