@@ -18,7 +18,7 @@ def paths(root: Path | None = None) -> dict[str, Path]:
         "llama_bin": root / "llama-bin",
         "data": root / "data",
         "runs": root / "runs",
-        "local_db": Path("/tmp/qmc/history.db"),
+        "local_db": root / "db" / "history.db",
     }
 
 
@@ -35,6 +35,7 @@ def apply_env(root: Path | None = None, *, ctx: int | None = 8192, web_search: s
         "QMC_SHARE": "false",
         "QMC_THINKING": "false",
         "QMC_WEB_SEARCH": web_search,
+        "QMC_AGENT": "off",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "GRADIO_ANALYTICS_ENABLED": "False",
     }

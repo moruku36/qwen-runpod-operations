@@ -49,8 +49,12 @@ class StageError(RuntimeError):
     pass
 
 
+class TrialRefused(StageError):
+    """A refusal is separate from the immutable status of the prior attempt."""
+
+
 class Runner:
-    def __init__(self, root: Path | None = None, mirror: Path | None | bool = True):
+    def __init__(self, root: Path | None = None, mirror: Path | None | bool = True, run_id: str | None = None):
         self.p = layout.paths(root)
         self.root = self.p["root"]
         self.runs = self.p["runs"]
@@ -63,6 +67,7 @@ class Runner:
             mirror = None if override == "off" else (Path(override) if override else MIRROR_PATH)
         self.mirror = mirror or None
         self._last_mirror = 0.0
+        self.run_id = run_id
 
     # ---- logging
     def _mirror(self, line: str) -> None:
@@ -75,13 +80,13 @@ class Runner:
             pass
 
     def event(self, stage: str, message: str) -> None:
-        line = logchannel.event_line(stage, message)
+        line = logchannel.event_line(stage, message, run_id=self.run_id)
         with open(self.logs / f"{stage}.log", "a", encoding="utf-8") as f:
             f.write(line + "\n")
         self._mirror(line)
 
     def emit_artifact(self, path: Path, name: str | None = None) -> None:
-        for line in logchannel.encode_artifact(path, name):
+        for line in logchannel.encode_artifact(path, name, run_id=self.run_id):
             self._mirror(line)
         self.event("emit", f"artifact {name or Path(path).name} sent to log stream")
 
@@ -163,7 +168,7 @@ def stage_selftest(r: Runner) -> None:
     """Prove the log channel end to end: an event line and a tiny artifact."""
     r.set_status("selftest", "running")
     probe = r.runs / "selftest.txt"
-    probe.write_text("qmc log channel selftest\n")
+    probe.write_bytes(b"qmc log channel selftest\n")
     r.event("selftest", "hello from the pod")
     r.emit_artifact(probe, "selftest.txt")
     r.set_status("selftest", "ok")
@@ -187,6 +192,8 @@ def probe_http(url: str, must_be_200: bool, *, opener=None, timeout: float = 20)
 def stage_net(r: Runner, *, opener=None, git_targets=None, http_targets=None) -> bool:
     """Reach every host the setup needs. A single failure means: stop the Pod and report."""
     r.set_status("net", "running")
+    from . import toolchain
+    toolchain.prepare(r)  # fail/repair early, before upstream clone or the large runtime install
     results = {}
     for name, url in (git_targets or GIT_TARGETS):
         rc = r.run("net", ["git", "ls-remote", url, "HEAD"], timeout=30, check=False,
@@ -208,6 +215,8 @@ def stage_source(r: Runner, *, repo_url: str = pins.UPSTREAM_REPO, sha: str = pi
     from . import provenance
 
     r.set_status("source", "running")
+    from . import toolchain
+    os.environ.update(toolchain.assert_ready(r.root))
     src = r.p["source"] / "qwen-multimodal-colab"
     if not (src / ".git").exists():
         r.run("source", ["git", "clone", "--filter=blob:none", repo_url, src])
@@ -240,7 +249,9 @@ def stage_venv(r: Runner, lock: Path, *, python: str | None = None, kernel_prefi
     if ver != envsetup.LOCK_PYTHON:  # the lock is hashed for CPython 3.11 wheels only
         r.set_status("venv", "fail", reason=f"python {ver or 'unknown'}; the lock needs {envsetup.LOCK_PYTHON}")
         raise StageError(f"python {ver or 'unknown'} cannot use the lock (needs {envsetup.LOCK_PYTHON})")
-    env = dict(envsetup.PIP_ENV)
+    from . import toolchain
+    os.environ.update(toolchain.assert_ready(r.root))
+    env = {**envsetup.activation_env(r.root), **envsetup.PIP_ENV}
     host_pip = False
     if not envsetup.venv_python(r.root).exists():
         if r.run("venv", envsetup.create_cmd(r.root, python), check=False) != 0:
@@ -262,13 +273,18 @@ def stage_venv(r: Runner, lock: Path, *, python: str | None = None, kernel_prefi
         r.set_status("venv", "fail", reason="pip check failed inside the venv")
         raise StageError("pip check failed inside the isolated venv")
     if register_kernel:
-        r.run("venv", envsetup.kernel_cmd(r.root, kernel_prefix), env=env, check=False)
-    r.set_status("venv", "ok", kernel=envsetup.KERNEL_NAME)
+        rc = r.run("venv", envsetup.kernel_cmd(r.root, kernel_prefix), env=env, check=False)
+        r.mark("kernel_registered", False)
+        if rc != 0:
+            raise StageError(f"kernel registration failed with exit code {rc}")
+        r.run("venv", envsetup.kernel_verify_cmd(r.root, kernel_prefix), env=env)
+        r.mark("kernel_registered", True)
+    r.set_status("venv", "ok", kernel=envsetup.KERNEL_NAME if register_kernel else "not_registered")
 
 
 def stage_build(r: Runner, *, run_llama=None, fetch=None) -> None:
     """Under the venv python: llama-server at the pinned commit, models at pinned revisions (SHA256-verified)."""
-    from . import llama, models
+    from . import llama, models, handoff
 
     r.set_status("build", "running")
     layout.apply_env(r.root)
@@ -279,9 +295,15 @@ def stage_build(r: Runner, *, run_llama=None, fetch=None) -> None:
              "build_type": "Release", "build_seconds": round(time.monotonic() - t0, 1), "built_this_run": not existing}
     r.mark("llama_built", server.exists())
     r.event("build", "llama-server ready; fetching pinned models")
+    t0 = time.monotonic()
     paths, records = (fetch or (lambda: models.fetch_pinned(r.p["hf_cache"])))()
-    r.mark("models_verified", all(x["sha256_verified"] for x in records))
+    build["download_seconds"] = round(time.monotonic() - t0, 1)
+    verified = len(records) == 2 and {x["role"] for x in records} == {"chat", "mmproj"} and all(x["sha256_verified"] for x in records)
+    r.mark("models_verified", verified)
+    if not server.exists() or not verified:
+        raise StageError("CUDA server or complete model verification missing")
     (r.runs / "build.json").write_text(json.dumps({
+        "handoff_schema": 1, "llama_commit": pins.LLAMA_CPP_COMMIT, "server_sha256": handoff.sha256(server),
         "server": str(server), "build": build, "records": records, "model_paths": [str(p) if p else None for p in paths]}))
     r.set_status("build", "ok", build_seconds=build["build_seconds"])
 
@@ -299,13 +321,26 @@ def write_login(root: Path, user: str, password: str) -> Path:
 
 
 def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: float = 0,
-                host: str | None = None, port: int | None = None, trial_id: str | None = None) -> Path:
+                host: str | None = None, port: int | None = None, trial_id: str | None = None,
+                full_features: bool = False, allow_search: bool = False, audio: Path | None = None,
+                transcript: str | None = None, test_deadline: float | None = None,
+                export_deadline: float | None = None, evaluation_profile: str | None = None) -> Path:
     """Launch the chat-only app, one capped smoke request, optional warm runs, then report + bundle."""
     import datetime
+
+    if evaluation_profile not in (None, "chat_only", "full_features"):
+        raise StageError("unknown evaluation profile")
+    if evaluation_profile == "chat_only" and (full_features or allow_search or audio is not None or transcript is not None):
+        raise StageError("chat-only profile rejects feature/search/audio execution")
+
+    if r.run_id and "trial" in r.status():
+        r.event("trial-refusal", "trial already attempted; prior status preserved; use a fresh run ID and root")
+        raise TrialRefused("trial already attempted in this run; use a fresh run ID and root")
 
     import gradio
 
     from . import launch, report, smoke, trial
+    from . import control, features
 
     r.set_status("trial", "running", mock=mock)
     env = layout.apply_env(r.root, ctx=8192, web_search="off")
@@ -314,61 +349,145 @@ def stage_trial(r: Runner, *, mock: bool = False, warm: bool = False, hold_min: 
                                    "revision": pins.MODELS["chat"]["revision"], "sha256_verified": False, "size_bytes": 0},
                                   {"role": "mmproj", "file": pins.MODELS["mmproj"]["file"],
                                    "revision": pins.MODELS["mmproj"]["revision"], "sha256_verified": False, "size_bytes": 0}]
-    build = {"cuda_archs": "none", "runtime_tag": "mock", "build_type": "none", "build_seconds": 0.0, "built_this_run": False}
-    server_version = "mock"
-    if not mock:
-        info = json.loads((r.runs / "build.json").read_text())
-        model_paths = tuple(Path(p) if p else None for p in info["model_paths"])
-        records, build = info["records"], info["build"]
-        from . import llama
-
-        server_version = llama.server_version(Path(info["server"]))
-    user, pw = "qwen-" + secrets.token_hex(3), secrets.token_urlsafe(18)
-    login = write_login(r.root, user, pw)
-    os.environ["QMC_AUTH_USER"], os.environ["QMC_AUTH_PASSWORD"] = user, pw
-    app = launch.launch(mock=mock, host=host, port=port, model_paths=model_paths)
-    try:
-        report.mark(checks, "app_launch", True)
-        report.mark(checks, "auth_enforced", launch.check_auth_enforced(app.cfg.server_port, host or "127.0.0.1"))
-        r.event("trial", f"UI up on port {app.cfg.server_port}; login file: {login}")
-        load = smoke.load_model(app)
-        first = smoke.first_response(app)
-        gpu = smoke.gpu_memory_mib()
-        report.mark(checks, "first_response", (not first["error"]) and first["stream_deltas"] > 0)
-        metrics = {"load_s": load["load_s"], "first_max_tokens": first["max_tokens"], "first_total_s": first["total_s"],
-                   "first_stream_deltas": first["stream_deltas"], "first_finish_reason": first["finish_reason"]}
-        if first["first_delta_s"] is not None:
-            metrics["first_first_delta_s"] = first["first_delta_s"]
-        if gpu.get("used_mib") is not None:
-            metrics["vram_used_mib"] = gpu["used_mib"]
-        if warm and checks["first_response"] == "pass":
-            prompts = ["日本の四季を50字で説明して。", "1から10までの和は？", "Pythonでリストを逆順にする方法は？",
-                       "富士山の高さは？", "挨拶を一言。", "Gitのcommitとpushの違いは？",
-                       "味噌汁の基本の作り方を3行で。", "TCPとUDPの違いを一言で。", "今日の気分を一言で。", "素数とは？"]
-            runs = smoke.warm_runs(app, prompts)
-            summary = smoke.summarize(runs)
-            crit = smoke.evaluate_criteria(runs)
-            report.mark(checks, "warm_runs", summary["ok_runs"] == len(prompts))
-            report.mark(checks, "perf_criteria", None if crit["verdict"] == "not_evaluated" else crit["verdict"] == "pass")
-            metrics.update({"warm_" + k: v for k, v in summary.items()})
-        deadline = time.monotonic() + hold_min * 60
-        while time.monotonic() < deadline:  # keep the UI up so the owner can log in and try it
-            r.event("trial", f"holding UI; {int(deadline - time.monotonic())}s left")
-            time.sleep(min(60, max(1, deadline - time.monotonic())))
-        rep = trial.build_report(
-            trial_id=trial_id or "t" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M"), repo_root=Path(__file__).resolve().parents[1],
-            lock_path=Path(__file__).resolve().parents[1] / "requirements-runpod.lock.txt", model_records=records, gpu=gpu,
-            build=build, checks=checks, metrics=metrics, server_version=server_version, gradio_version=gradio.__version__,
-            settings={"ctx": int(env["QMC_CHAT_CTX"]), "thinking": False, "web_search": "off", "asr_device": "cpu",
-                      "asr_model": "small", "tts": False, "share": False, "chat_only": True},
-            notes=["report_exported is confirmed outside the Pod after read-back", "perf criteria need 10 warm runs"]
-            + (["CPU rehearsal with the mock backend"] if mock else []))
-        path = report.write_report(rep, r.runs)
-        bundle = r.runs / (path.stem + ".tar.gz")
-        report.make_bundle([path], bundle)
-        r._write(r.checks_path, checks)
-        r.emit_artifact(bundle)
-        r.set_status("trial", "ok", bundle=bundle.name)
-        return bundle
-    finally:
-        launch.stop_app(app)
+    build = ({"cuda_archs": "none", "runtime_tag": "mock", "build_type": "none", "build_seconds": 0.0, "built_this_run": False}
+             if mock else {"cuda_archs": "unavailable", "runtime_tag": "unavailable", "build_type": "unavailable"})
+    server_version = "mock" if mock else "unavailable"
+    app, failure = None, None
+    server_path = None
+    effective_ctx = 8192
+    metrics, gpu, feature_results = {}, {}, features.template()
+    ui_snapshot_frozen = False
+    if not mock and r.run_id:
+        feature_results["ui_chat"] = features.ui_receipt(r.root / "ui-check.json", r.run_id)
+    notes = ["report_exported is confirmed outside the Pod after read-back", "perf criteria need 10 warm runs"]
+    if mock:
+        notes.append("CPU rehearsal with the mock backend")
+    def sample_saved(rows):
+        metrics["warm_samples"] = list(rows)
+        r._write(r.runs / "warm-samples.json", {"samples": rows})
+    def work():
+        control.check_work(test_deadline, r.root / "CANCEL")
+    with control.finalization_guard(export_deadline) as arm_finalization:
+        try:
+            try:
+                with control.work_guard(test_deadline, r.root / "CANCEL"):
+                    if not mock:
+                        from . import handoff
+                        info = handoff.read_build(r.root)
+                        server_path = Path(info["server"])
+                        model_paths = tuple(Path(p) if p else None for p in info["model_paths"])
+                        records, build = info["records"], info["build"]
+                        from . import llama
+                        server_version = llama.server_version(Path(info["server"]))
+                    user, pw = "qwen-" + secrets.token_hex(3), secrets.token_urlsafe(18)
+                    login = write_login(r.root, user, pw)
+                    os.environ["QMC_AUTH_USER"], os.environ["QMC_AUTH_PASSWORD"] = user, pw
+                    app = launch.launch(mock=mock, host=host, port=port, model_paths=model_paths, server_path=server_path)
+                    report.mark(checks, "app_launch", True)
+                    report.mark(checks, "auth_enforced", launch.check_auth_enforced(app.cfg.server_port, host or "127.0.0.1"))
+                    r.event("trial", f"UI up on port {app.cfg.server_port}; login file: {login}")
+                    gpu = smoke.gpu_memory_mib()  # record hardware even if model startup fails
+                    load = smoke.load_model(app)
+                    effective_ctx = load.get("effective_ctx", 8192)
+                    if not mock and effective_ctx != 8192:
+                        raise StageError("effective_context_changed_from_approved_8192")
+                    work()
+                    first = smoke.first_response(app)
+                    gpu = smoke.gpu_memory_mib()
+                    report.mark(checks, "first_response", (not first["error"]) and first["stream_deltas"] > 0)
+                    metrics = {"load_s": load["load_s"], "first_max_tokens": first["max_tokens"], "first_total_s": first["total_s"],
+                               "first_stream_deltas": first["stream_deltas"], "first_finish_reason": first["finish_reason"]}
+                    if first["first_delta_s"] is not None:
+                        metrics["first_first_delta_s"] = first["first_delta_s"]
+                    if gpu.get("used_mib") is not None:
+                        metrics["vram_used_mib"] = gpu["used_mib"]
+                    if warm and checks["first_response"] == "pass":
+                        prompts = ["日本の四季を50字で説明して。", "1から10までの和は？", "Pythonでリストを逆順にする方法は？",
+                                   "富士山の高さは？", "挨拶を一言。", "Gitのcommitとpushの違いは？",
+                                   "味噌汁の基本の作り方を3行で。", "TCPとUDPの違いを一言で。", "今日の気分を一言で。", "素数とは？"]
+                        runs = smoke.warm_runs(app, prompts, on_sample=sample_saved, before_sample=work)
+                        summary = smoke.summarize(runs)
+                        crit = smoke.evaluate_criteria(runs)
+                        report.mark(checks, "warm_runs", summary["ok_runs"] == len(prompts))
+                        report.mark(checks, "perf_criteria", None if crit["verdict"] == "not_evaluated" else crit["verdict"] == "pass")
+                        metrics.update({"warm_" + k: v for k, v in summary.items()})
+                        metrics["warm_samples"] = runs
+                    # UI observation belongs to the 8k baseline, before the explicit 32k reload.
+                    deadline = time.monotonic() + hold_min * 60
+                    while time.monotonic() < deadline and not (r.root / "ui-check.json").exists():
+                        if (r.root / "CANCEL").exists() or (test_deadline is not None and time.time() >= test_deadline):
+                            break
+                        r.event("trial", f"8k UI observation window; {int(deadline - time.monotonic())}s left")
+                        time.sleep(min(5, max(.1, deadline - time.monotonic())))
+                    # Freeze the 8k observation before feature adapters may reload at 32k or rewrite files.
+                    ui_snapshot = features.ui_receipt(r.root / "ui-check.json", r.run_id) if not mock and r.run_id else None
+                    ui_snapshot_frozen = True
+                    feature_results = features.template()
+                    if ui_snapshot is not None:
+                        feature_results["ui_chat"] = ui_snapshot
+                    if full_features and not mock and checks["first_response"] == "pass" and checks["auth_enforced"] == "pass":
+                        feature_results = features.run(app, r.root / "fixtures", allow_search=allow_search,
+                                                       audio=audio, transcript=transcript, deadline=test_deadline,
+                                                       cancel=r.root / "CANCEL",
+                                                       on_result=lambda name,row: feature_results.update({name: row}))
+                    elif mock:
+                        for row in feature_results.values():
+                            row["reason"] = "CPU mock is not real feature evidence"
+                    if ui_snapshot is not None:
+                        feature_results["ui_chat"] = ui_snapshot
+            except control.WorkInterrupted:
+                failure = "work_interrupted"
+                if not ui_snapshot_frozen and not mock and r.run_id:
+                    feature_results["ui_chat"] = features.ui_receipt(r.root / "ui-check.json", r.run_id)
+                notes.append("work interrupted; diagnostic export within separate outer deadline")
+                for row in feature_results.values():
+                    if row["status"] == "skipped":
+                        row["reason"] = "work deadline or cancellation; not completed"
+            except (Exception, KeyboardInterrupt, SystemExit) as exc:
+                failure = type(exc).__name__
+                if not ui_snapshot_frozen and not mock and r.run_id:
+                    feature_results["ui_chat"] = features.ui_receipt(r.root / "ui-check.json", r.run_id)
+                notes.append("runtime failed: " + failure)
+                from . import handoff
+                notes.append("runtime reason: " + handoff.failure_code(exc))
+                for row in feature_results.values():
+                    if row["status"] == "skipped":
+                        row["reason"] = "work failed or interrupted; not completed"
+            # Finalize even on work cancellation/error.
+            arm_finalization()
+            if not mock and build.get("runtime_tag") == "unavailable":
+                notes.append("build metadata unavailable; build timings not measured")
+            if evaluation_profile == "chat_only":
+                for name in ("ctx_32k", "image_understanding", "web_search", "asr", "history_restore"):
+                    feature_results[name] = {"status": "skipped", "reason": "not requested by approved chat-only profile",
+                                             "evidence": {}, "urls": []}
+            for name, row in feature_results.items():
+                checks[name] = row["status"]
+            rep = trial.build_report(
+                trial_id=trial_id or r.run_id or "t" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M"), repo_root=Path(__file__).resolve().parents[1],
+                lock_path=Path(__file__).resolve().parents[1] / "requirements-runpod.lock.txt", model_records=records, gpu=gpu,
+                build=build, checks=checks, metrics=metrics, server_version=server_version, gradio_version=gradio.__version__,
+                settings={"ctx": effective_ctx, "thinking": False, "web_search": "off",
+                          "asr_device": "not_requested" if evaluation_profile == "chat_only" else "cpu",
+                          "asr_model": "not_requested" if evaluation_profile == "chat_only" else "small",
+                          "tts": False, "share": False, "chat_only": True},
+                notes=notes, capture_runtime=failure is None)
+            rep["execution_mode"] = "cpu_mock" if mock else "real_gpu"
+            rep["evaluation_profile"] = evaluation_profile or ("full_features" if full_features else "baseline")
+            rep["feature_scope"] = {name: "not_requested" for name in
+                ("ctx_32k", "image_understanding", "web_search", "asr", "history_restore")} if evaluation_profile == "chat_only" else {}
+            rep["features"] = feature_results
+            path = report.write_report(rep, r.runs)
+            bundle = r.runs / (path.stem + ".tar.gz")
+            report.make_bundle([path], bundle)
+            r._write(r.checks_path, checks)
+            r.emit_artifact(bundle)
+            failed = failure is not None or any(checks[name] == "fail" for name in ("auth_enforced", "first_response", "warm_runs"))
+            r.set_status("trial", "fail" if failed else "ok", bundle=bundle.name,
+                         feature_coverage="partial" if any(row["status"] == "skipped" for row in feature_results.values()) else "attempted")
+            if failed:
+                raise StageError("trial interrupted or acceptance failed; diagnostic bundle was emitted")
+            return bundle
+        finally:
+            if app is not None:
+                launch.stop_app(app)

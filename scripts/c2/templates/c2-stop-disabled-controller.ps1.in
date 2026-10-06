@@ -1,0 +1,24 @@
+# INERT REVIEW TEMPLATE: regenerate all paths, pins, manifest and ACL proof before deployment.
+function New-C2StopFlagExclusive([string]$Path) {
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {$bytes=[Text.Encoding]::UTF8.GetBytes('stop');$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}
+    finally {$stream.Dispose()}
+}
+
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'c2-path-guard.ps1')
+$root = Get-C2DeploymentRoot
+$recordPath = Join-Path $root 'runtime\disabled-controller.json'
+if (-not (Test-Path -LiteralPath $recordPath)) {
+    if (@(Get-NetTCPConnection -State Listen -LocalPort 19180 -ErrorAction SilentlyContinue).Count -or @(Get-C2ControllerCandidates).Count) { throw 'Unowned controller/listener; no stop.' }
+    Write-Output 'No owned disabled controller is running.'
+    return
+}
+$record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+if ($record.deployment_root -cne $root -or $record.mode -cne 'C2_disabled_no_credentials' -or $record.runpod_effects -ne $false) { throw 'Owned disabled record mismatch.' }
+$python = '@@REVIEWED_LOCAL_PATH@@'
+$snapshot = Get-C2OldSnapshot $root $python $C2ExpectedOwnerSid
+if ($snapshot.decision -ceq 'none') { throw 'Stale new controller record; review instead of overwriting.' }
+$flag = Join-Path $root 'runtime\stop-disabled-controller.flag'
+New-C2StopFlagExclusive $flag
+Write-Output 'Stop requested for the exact owned disabled controller; no force-stop.'

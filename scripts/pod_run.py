@@ -24,11 +24,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from qmc_runpod import envsetup, layout, stages
-
-for p in (layout.paths()["source"] / "qwen-multimodal-colab" / "src",):
-    if p.is_dir():
-        sys.path.insert(0, str(p))
+from qmc_runpod import envsetup, stages
 
 
 def _self(argv):
@@ -39,8 +35,12 @@ def _reexec_in_venv(root):
     py = envsetup.venv_python(root)
     if not py.exists():
         sys.exit("the isolated venv does not exist yet: run `python scripts/pod_run.py venv` first")
+    env = envsetup.activation_env(root)
     if not envsetup.running_in_venv(root):
-        os.execv(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]])
+        os.execve(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]], env)
+    os.environ.pop("PYTHONHOME", None)
+    os.environ.pop("PYTHONPATH", None)
+    os.environ.update(env)
 
 
 def cmd_status(r):
@@ -73,12 +73,26 @@ def main(argv=None):
     ap.add_argument("stage", choices=[*stages.STAGES, "all", "status", "emit"])
     ap.add_argument("file", nargs="?")
     ap.add_argument("--root", type=Path, default=None)
+    ap.add_argument("--run-id", default=None)
+    ap.add_argument("--features", action="store_true")
+    ap.add_argument("--evaluation-profile", choices=("chat_only", "full_features"))
+    ap.add_argument("--allow-public-search", action="store_true")
+    ap.add_argument("--audio", type=Path)
+    ap.add_argument("--transcript-file", type=Path)
+    ap.add_argument("--test-deadline", type=float)
+    ap.add_argument("--export-deadline", type=float)
     ap.add_argument("--bg", action="store_true")
     ap.add_argument("--warm", action="store_true")
     ap.add_argument("--hold-min", type=float, default=0)
     ap.add_argument("--mock", action="store_true", help="CPU rehearsal with the mock backend (no model, no GPU)")
     a = ap.parse_args(argv)
-    r = stages.Runner(a.root)
+    r = stages.Runner(a.root, run_id=a.run_id)
+    # Use the same source root as stage_source, including an explicit --root.
+    upstream_src = r.p["source"] / "qwen-multimodal-colab" / "src"
+    if upstream_src.is_dir():
+        sys.path.insert(0, str(upstream_src))
+    elif a.stage in stages.VENV_STAGES and not a.mock:
+        sys.exit("pinned upstream source missing from this run root; refusing package fallback")
     if a.bg:
         rest = [x for x in (argv if argv is not None else sys.argv[1:]) if x != "--bg"]
         logf = open(r.logs / f"{a.stage}.bg.log", "a")  # noqa: SIM115
@@ -111,7 +125,14 @@ def main(argv=None):
         elif a.stage == "build":
             stages.stage_build(r)
         elif a.stage == "trial":
-            stages.stage_trial(r, mock=a.mock, warm=a.warm, hold_min=a.hold_min)
+            stages.stage_trial(r, mock=a.mock, warm=a.warm, hold_min=a.hold_min,
+                               evaluation_profile=a.evaluation_profile,
+                               full_features=a.features, allow_search=a.allow_public_search, audio=a.audio,
+                               transcript=a.transcript_file.read_text(encoding="utf-8").strip() if a.transcript_file else None,
+                               test_deadline=a.test_deadline, export_deadline=a.export_deadline)
+    except stages.TrialRefused as exc:
+        print(f"{a.stage} refused: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:  # noqa: BLE001
         r.set_status(a.stage, "fail", error=type(exc).__name__, message=str(exc)[:200])
         print(f"{a.stage} failed: {exc}", file=sys.stderr)

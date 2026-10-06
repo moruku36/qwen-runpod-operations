@@ -164,6 +164,7 @@ class PodApi:
         _check_id(pod_id)
         params = {"tail": min(max(tail, 0), 5000), **({"source": source} if source else {})}
         events: list[dict] = []
+        self.last_log_read = {"state": "partial", "error": None, "events": 0}
         try:
             r = self.s.request("GET", f"{self.base}/pods/{pod_id}/logs", params=params, stream=True,
                                timeout=(5, wait_s))
@@ -180,8 +181,11 @@ class PodApi:
                     break
         except PodApiError:
             raise
-        except Exception:  # noqa: BLE001, S110 - a read timeout just means the backfill is finished
-            pass
+        except Exception as exc:  # timeout and interrupted backfill are observations, not success
+            self.last_log_read["error"] = type(exc).__name__
+        self.last_log_read["events"] = len(events)
+        if not events:
+            self.last_log_read["state"] = "empty"
         return events
 
     # ---- paid action (guarded)
@@ -228,9 +232,8 @@ class PodApi:
 
     def stop_and_confirm(self, pod_id: str, *, timeout_s: float = 300, interval_s: float = 10,
                          sleep=None, clock=None) -> dict:
-        """Stop, then read back until the deadline. Confirmed only when status is EXITED *and* ``cost`` is
-        present and the number 0 (missing/null/bool/other values are not treated as 0). Communication errors
-        do not end the loop early. Raises StopFailed (with the pod id and console steps) otherwise."""
+        """Stop, then observe API EXITED. Log/console corroboration and Billing remain external checks.
+        The API cost field is not settled billing. Communication failures keep polling until deadline."""
         _check_id(pod_id)
         sleep, clock = sleep or time.sleep, clock or time.monotonic  # resolved per call, so tests can patch them
         deadline = clock() + timeout_s
@@ -240,8 +243,9 @@ class PodApi:
                 if stop_code != 200:
                     stop_code = self.stop_pod(pod_id)  # a 409 (already stopping/stopped) falls through to the read-back
                 last = self.get_pod(pod_id)
-                if cost_is_confirmed_zero(last) and last.get("status") == "EXITED":
-                    return last
+                if last.get("status") == "EXITED":
+                    return {**last, "compute_api_exited": True, "stop_corroborated": False,
+                            "billing_reconciled": False, "billing_state": "pending"}
             except Exception as exc:  # noqa: BLE001 - keep trying until the deadline
                 last_error = type(exc).__name__
             if clock() >= deadline:
@@ -271,7 +275,7 @@ def console_stop_instructions(pod_id: str, http_status: int | None, last: dict |
         f"last cost {cost}, last error {error or 'none'})\n"
         f"Target pod id: {pod_id}\n"
         f"Console steps: open {CONSOLE_PODS_URL} → find this pod id → Stop (not Terminate) →\n"
-        "confirm the status becomes Exited and the hourly cost is 0. If the pod is locked, unlock it first.\n"
+        "confirm API Exited, system shutdown log and console Compute/Container Not running. Reconcile Billing separately.\n"
         "Do not touch other pods."
     )
 

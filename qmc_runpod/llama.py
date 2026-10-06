@@ -21,10 +21,12 @@ def bin_dir(archs: str, root: Path | None = None) -> Path:
 
 
 def install(root: Path | None = None, *, run=None) -> Path:
+    from . import toolchain
     from qmc import colab
 
     if colab.LLAMA_CPP_COMMIT != pins.LLAMA_CPP_COMMIT:
         raise RuntimeError("upstream llama.cpp pin changed; update pins.py after reviewing the diff")
+    os.environ.update(toolchain.assert_ready(root))
     run = run or colab._run
     if shutil.which("nvcc") is None:
         raise RuntimeError("nvcc がありません。CUDA devel 系イメージのPodで実行してください")
@@ -44,7 +46,14 @@ def install(root: Path | None = None, *, run=None) -> Path:
     run(["git", "-C", str(src), "fetch", "--depth", "1", "origin", pins.LLAMA_CPP_COMMIT])
     run(["git", "-C", str(src), "checkout", "-q", pins.LLAMA_CPP_COMMIT])
     build = src / "build"
-    run(colab.cmake_configure_cmd(src, build, archs))
+    configure = colab.cmake_configure_cmd(src, build, archs)
+    # Configure the exact compiler/tool paths audited by the early gate.
+    # Unrelated CC/CXX defaults must not silently select an untested compiler.
+    configure += [f"-D{key}={shutil.which(tool)}" for key, tool in (
+        ("CMAKE_C_COMPILER", "gcc"), ("CMAKE_CXX_COMPILER", "g++"),
+        ("CMAKE_CUDA_COMPILER", "nvcc"), ("CMAKE_CUDA_HOST_COMPILER", "g++"),
+        ("CMAKE_MAKE_PROGRAM", "ninja"))]
+    run(configure)
     run(["cmake", "--build", str(build), "--config", "Release", "--target", "llama-server",
          "-j", str(os.cpu_count() or 4)])
     out.mkdir(parents=True, exist_ok=True)
@@ -55,8 +64,14 @@ def install(root: Path | None = None, *, run=None) -> Path:
 
 
 def server_version(server: Path) -> str:
+    """A loader failure is a launch failure, never a plausible version string."""
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = f"{server.parent}:{env.get('LD_LIBRARY_PATH', '')}"
     try:
-        r = subprocess.run([str(server), "--version"], capture_output=True, text=True, timeout=30, check=False)
-        return (r.stdout + r.stderr).strip().splitlines()[0][:200]
-    except Exception:  # noqa: BLE001
-        return "unknown"
+        r = subprocess.run([str(server), "--version"], capture_output=True, text=True, timeout=30, check=False, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("llama_server_runtime_probe_failed") from exc
+    lines = (r.stdout + r.stderr).strip().splitlines()
+    if r.returncode != 0 or not lines:
+        raise RuntimeError("llama_server_runtime_probe_failed")
+    return lines[0][:200]

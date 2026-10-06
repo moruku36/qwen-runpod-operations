@@ -1,0 +1,62 @@
+# INERT REVIEW TEMPLATE: regenerate all paths, pins, manifest and ACL proof before deployment.
+function Write-C2NewJsonExclusive([string]$Path,[string]$Json) {
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {$bytes=(New-Object Text.UTF8Encoding($true)).GetBytes($Json);$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}
+    finally {$stream.Dispose()}
+}
+
+# Run manually by service-owner in a private local PowerShell window. No network calls.
+# No value is printed or sent to Codex. This records INPUT only; no activation.
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'c2-path-guard.ps1')
+$deploymentRoot = Get-C2DeploymentRoot
+$configRoot = Join-Path $deploymentRoot 'config'
+if (([System.Security.Principal.WindowsIdentity]::GetCurrent().Name -split '\\')[-1] -ne 'service-owner') { throw 'Run as the approved service-owner account.' }
+if (-not (Test-Path -LiteralPath $configRoot -PathType Container)) { throw 'Approved protected C2 directory is missing.' }
+$subject = Read-Host 'Your authenticated Open WebUI application user ID (not password/token)'
+if ($subject -cnotmatch '^[A-Za-z0-9_-]{1,128}$') { throw 'Invalid application user ID.' }
+$sshReference = Read-Host 'Exact existing SSH private-key path, or leave blank for later'
+if ($sshReference) {
+    if (-not [System.IO.Path]::IsPathRooted($sshReference) -or -not (Test-Path -LiteralPath $sshReference -PathType Leaf)) { throw 'An exact existing absolute key path is required.' }
+    $sshReference = [System.IO.Path]::GetFullPath($sshReference)
+}
+function New-LocalRoleKey {
+    # Executed only by the user's manual invocation. Never print/copy the key.
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $key = New-Object System.Security.SecureString
+    try {
+        $rng.GetBytes($bytes)
+        foreach ($byteValue in $bytes) {
+            foreach ($character in $byteValue.ToString('x2').ToCharArray()) { $key.AppendChar($character) }
+        }
+        $key.MakeReadOnly()
+        return $key
+    }
+    catch { $key.Dispose(); throw }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length); $rng.Dispose() }
+}
+$inference = Read-Host 'Dedicated localhost inference key; ENTER generates one locally without displaying it' -AsSecureString
+if ($inference.Length -eq 0) { $inference.Dispose(); $inference = New-LocalRoleKey }
+$control = Read-Host 'Different localhost control key; ENTER generates another locally without displaying it' -AsSecureString
+if ($control.Length -eq 0) { $control.Dispose(); $control = New-LocalRoleKey }
+function Test-KeyShape([System.Security.SecureString]$key) {
+    $pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($key)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) -cmatch '^[A-Za-z0-9._~-]{16,256}$' }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+}
+if (-not (Test-KeyShape $inference) -or -not (Test-KeyShape $control)) { throw 'Invalid dedicated key shape.' }
+$left = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($inference)
+$right = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($control)
+try { if ([System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($left) -ceq [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($right)) { throw 'Keys must differ.' } }
+finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($left); [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($right) }
+$publicPath = Join-Path $configRoot 'user-input.json'
+$credentialPath = Join-Path $configRoot 'backend-credentials.dpapi.json'
+if ((Test-Path -LiteralPath $publicPath) -or (Test-Path -LiteralPath $credentialPath)) { throw 'Existing input will not be overwritten; request an explicit update.' }
+# Windows ConvertFrom-SecureString uses the current user's DPAPI protection.
+$encrypted = [ordered]@{inference_key=(ConvertFrom-SecureString -SecureString $inference);control_key=(ConvertFrom-SecureString -SecureString $control)}
+Write-C2NewJsonExclusive $credentialPath ($encrypted | ConvertTo-Json)
+Write-C2NewJsonExclusive $publicPath ([ordered]@{subject=$subject;ssh_key_reference=$sshReference;enabled=$false;runpod_effects=$false;provider_credential_entered=$false} | ConvertTo-Json)
+$inference.Dispose()
+$control.Dispose()
+Write-Output 'Protected input saved. Bridge and RunPod effects remain disabled. No SSH private-key contents were read; no network request was sent.'

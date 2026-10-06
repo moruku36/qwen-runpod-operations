@@ -1,5 +1,14 @@
 # Qwen RunPod 運用記録
 
+更新：2026年10月6日。**CPU実装C1と無効状態のC2 v5は受理済み、C3の実on-demand
+有効化は未実施**です。cached A100/27B診断はcontext8192、load347.956秒で1要求成功。
+[現在の到達点](docs/development-status-2026-10-06.ja.md)、
+[English](docs/development-status-2026-10-06.en.md)、
+[C2復旧制約](scripts/c2/README.md)を参照してください。
+公開はprovider有効化、Pod作成・起動・Terminate、追加課金の許可ではありません。
+
+以下の10月2日記録は履歴です。保持・課金・未試験の記述は当時の状態を示します。
+
 [English](README.md) | 日本語
 
 更新日: 2026-10-02。**初回の有料実験では接続確認、独立Python環境、小さな成果物の外部回収まで進んだ。CUDAビルドとQwenのGPU推論は未検証。** 実験用の2つのPodは16:05頃JSTまでに停止したが、80GBのPod Volumeが2つ残り、保管料は合計約$1.07/日。撤収と最終Billing照合は未完了。詳細は[実験レポート全文](docs/trial-report-2026-10-02.ja.md)を参照。
