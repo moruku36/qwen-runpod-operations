@@ -472,13 +472,40 @@ def test_no_terminate_or_delete_in_podapi():
 
 
 def test_no_key_handling_in_code():
+    # The original CLI delegates management authentication to runpodctl. The
+    # separately reviewed bridge accepts explicitly injected role credentials;
+    # its headers are intentional and its constructors deny execution by default.
+    bridge_auth_modules = {
+        "bootstrap_execution.py", "execution_adapters.py", "mock_gateway.py",
+        "private_chat.py", "private_gateway.py", "production_gateway.py",
+        "single_user_owui.py", "upstream_sse.py",
+    }
     for f in list(PKG.glob("*.py")) + [ROOT / "scripts" / "pod.py"]:
-        code = "\n".join(line for line in f.read_text().splitlines() if not line.lstrip().startswith(("#", '"""')))
+        code = "\n".join(line for line in f.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith(("#", '"""')))
         assert "RUNPOD_API_KEY" not in code, f
-        assert not re.search(r"headers\s*=|Bearer|os\.environ\[.*KEY", code) or f.name in {"report.py", "features.py"}, f
+        if f.name not in bridge_auth_modules:
+            assert not re.search(r"headers\s*=|Bearer|os\.environ\[.*KEY", code) or f.name in {"report.py", "features.py"}, f
         if f.name == "features.py":
             assert 'base.startswith("http://127.0.0.1:")' in code
             assert 'model.client._headers()' in code  # existing ephemeral localhost authentication only
+
+
+def test_no_ambient_credential_lookup_in_package():
+    # Header syntax alone cannot distinguish injected authentication from secret
+    # discovery. Inspect executable AST (not remote script strings) across every
+    # package module and the CLI, keeping the old CLI syntax check above.
+    for f in list(PKG.glob("*.py")) + [ROOT / "scripts" / "pod.py"]:
+        tree = ast.parse(f.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            key = None
+            if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                    and ast.unparse(node.value) == "os.environ"):
+                key = node.slice
+            elif (isinstance(node, ast.Call) and node.args
+                  and ast.unparse(node.func) in {"os.getenv", "os.environ.get", "os.environ.pop"}):
+                key = node.args[0]
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                assert not re.search(r"KEY|TOKEN|BEARER|PASSWORD|SECRET|CREDENTIAL", key.value, re.I), (f.name, node.lineno)
 
 
 # ---------------------------------------------------------------- notebook
