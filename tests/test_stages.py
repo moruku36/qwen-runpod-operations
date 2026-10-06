@@ -92,7 +92,9 @@ class Resp:
         return self.status
 
 
-def test_net_stage_passes_when_everything_is_reachable(tmp_path):
+def test_net_stage_passes_when_everything_is_reachable(tmp_path, monkeypatch):
+    from qmc_runpod import toolchain
+    monkeypatch.setattr(toolchain, "prepare", lambda r: None)
     r = runner(tmp_path)
     git = [("repo", "https://example.invalid/x")]
     r.run = lambda stage, cmd, **kw: 0  # git ls-remote succeeded
@@ -101,7 +103,9 @@ def test_net_stage_passes_when_everything_is_reachable(tmp_path):
     assert ok and r.status()["net"]["state"] == "ok"
 
 
-def test_net_stage_fails_on_no_route_to_host_and_says_to_stop(tmp_path):
+def test_net_stage_fails_on_no_route_to_host_and_says_to_stop(tmp_path, monkeypatch):
+    from qmc_runpod import toolchain
+    monkeypatch.setattr(toolchain, "prepare", lambda r: None)
     r = runner(tmp_path)
     r.run = lambda stage, cmd, **kw: 128   # git cannot reach GitHub
 
@@ -158,6 +162,9 @@ def test_real_venv_is_created_without_system_site_packages(tmp_path):
 
 
 def test_venv_stage_refuses_a_non_isolated_venv_and_checks_pip_inside_it(tmp_path, monkeypatch):
+    from qmc_runpod import toolchain
+    monkeypatch.setattr(toolchain, "assert_ready", lambda root: {})
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="3.11"))
     r = runner(tmp_path)
     calls = []
 
@@ -172,7 +179,7 @@ def test_venv_stage_refuses_a_non_isolated_venv_and_checks_pip_inside_it(tmp_pat
     stages.stage_venv(r, Path("lock.txt"), register_kernel=True)
     flat = [" ".join(c) for c in calls]
     assert any("-m venv" in c for c in flat) and any("--require-hashes" in c for c in flat)
-    assert any(c.endswith("-m pip check") and "venv/bin/python" in c for c in flat)       # never the system pip
+    assert any(c.endswith("-m pip check") and str(envsetup.venv_python(r.root)) in c for c in flat)
     assert any("ipykernel install" in c for c in flat)
     assert r.checks()["lock_installed"] == "pass" and r.status()["venv"]["state"] == "ok"
     # pip check failing inside the venv fails the stage and the check
@@ -190,7 +197,8 @@ def test_venv_stage_refuses_a_non_isolated_venv_and_checks_pip_inside_it(tmp_pat
     assert r2.checks()["lock_installed"] == "fail"
 
 
-def test_venv_stage_refuses_a_python_the_lock_was_not_built_for(tmp_path):
+def test_venv_stage_refuses_a_python_the_lock_was_not_built_for(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="3.10"))
     r = runner(tmp_path)
     r.run = lambda *a, **k: 0
     fake = tmp_path / "py310"
@@ -201,7 +209,10 @@ def test_venv_stage_refuses_a_python_the_lock_was_not_built_for(tmp_path):
     assert r.status()["venv"]["state"] == "fail"
 
 
-def test_venv_stage_falls_back_to_host_pip_when_ensurepip_is_missing(tmp_path):
+def test_venv_stage_falls_back_to_host_pip_when_ensurepip_is_missing(tmp_path, monkeypatch):
+    from qmc_runpod import toolchain
+    monkeypatch.setattr(toolchain, "assert_ready", lambda root: {})
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="3.11"))
     r = runner(tmp_path)
     calls = []
 
@@ -230,7 +241,9 @@ def test_kernel_in_notebook_is_required_and_lock_has_ipykernel():
 
 
 # ---------------------------------------------------------------- source stage (local repo stands in for GitHub)
-def test_source_stage_pins_commit_and_blob(tmp_path):
+def test_source_stage_pins_commit_and_blob(tmp_path, monkeypatch):
+    from qmc_runpod import toolchain
+    monkeypatch.setattr(toolchain, "assert_ready", lambda root: {})
     src = tmp_path / "up"
     subprocess.run(["git", "init", "-q", str(src)], check=True)
     (src / "Qwen-Q8-Chat-Colab.ipynb").write_text("{}")
@@ -248,6 +261,7 @@ def test_source_stage_pins_commit_and_blob(tmp_path):
 
 
 # ---------------------------------------------------------------- login file
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not Windows ACLs")
 def test_login_file_is_private_and_never_logged(tmp_path):
     f = stages.write_login(tmp_path / "ws", "user1", "s3cr3t-pass")
     assert (f.stat().st_mode & 0o777) == 0o600 and (f.parent.stat().st_mode & 0o777) == 0o700

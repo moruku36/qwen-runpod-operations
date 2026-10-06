@@ -1,0 +1,19 @@
+{
+  "example_only_no_config_loader": true,
+  "apply_settings": false,
+  "io_enabled": false,
+  "connection_type": "openai-compatible-protocol",
+  "openai_cloud_service": false,
+  "owui_backend_same_windows_host_required": true,
+  "owui_candidate_base_url": "http://127.0.0.1:19180/v1",
+  "private_tunnel_candidate_base_url": "http://127.0.0.1:19181/v1",
+  "model": "qwen-27b",
+  "authentication_values": null,
+  "automatic_start_on_chat": false,
+  "automatic_start_on_model_list": false,
+  "automatic_start_on_background_tasks": false,
+  "runpod_api_enabled": false,
+  "tunnel_creation_enabled": false,
+  "real_provider_mutations_enabled": false,
+  "controller_live_integration_enabled": false
+}

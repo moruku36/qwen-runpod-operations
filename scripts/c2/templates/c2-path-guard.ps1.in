@@ -1,0 +1,20 @@
+# INERT REVIEW TEMPLATE: regenerate all paths, pins, manifest and ACL proof before deployment.
+# Shared canonical path for helper/controller/config/state/logs in both actors.
+$C2CanonicalRoot = '@@REVIEWED_LOCAL_PATH@@'
+$C2ExpectedOwnerSid = '@@REVIEWED_OWNER_SID@@'
+$core = Join-Path $PSScriptRoot 'c2-migration-core.ps1'
+if ((Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLowerInvariant() -cne '77d4bb339ea6f3b9dc22e72300a9672279b3d6ab1f8ccebc664e36a04cc5fb57') { throw 'Installed path guard core changed.' }
+. $core
+function Get-C2DeploymentRoot {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($identity.User.Value -cne $C2ExpectedOwnerSid) { throw 'Approved service-owner identity required.' }
+    foreach ($path in @($C2CanonicalRoot,(Join-Path $C2CanonicalRoot 'operators'),(Join-Path $C2CanonicalRoot 'runtime'),(Join-Path $C2CanonicalRoot 'config'),(Join-Path $C2CanonicalRoot 'state'),(Join-Path $C2CanonicalRoot 'trust'),(Join-Path $C2CanonicalRoot 'logs'))) { Assert-C2PhysicalPath $path }
+    $acl = Get-Acl -LiteralPath $C2CanonicalRoot
+    $allowed = @($C2ExpectedOwnerSid,'S-1-5-18','S-1-5-32-544')
+    if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $C2ExpectedOwnerSid -or $acl.Access.Count -ne 3) { throw 'Protected root ACL mismatch.' }
+    foreach ($rule in $acl.Access) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($sid -notin $allowed -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw 'Protected root ACL principal mismatch.' }
+    }
+    return $C2CanonicalRoot
+}

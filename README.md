@@ -1,5 +1,16 @@
 # Qwen RunPod operations
 
+Updated: October 6, 2026. **C1 CPU implementation and disabled C2 v5 are
+accepted; C3 live on-demand activation remains unexecuted.** The cached A100/27B
+diagnostic completed one request at context8192 (load347.956s). See the
+[current development record](docs/development-status-2026-10-06.en.md),
+[日本語](docs/development-status-2026-10-06.ja.md), and
+[C2 recovery constraints](scripts/c2/README.md). Publishing does not enable a
+provider, create/restart/terminate a Pod, or authorize further spending.
+
+The following October 2 account is a historical snapshot. Its retention, billing
+and “untested” statements describe that date, not the current development status.
+
 English | [日本語](README.ja.md)
 
 Updated: October 2, 2026. **The first paid experiment reached connectivity, isolated Python setup, and small-artifact export. CUDA builds and Qwen GPU inference remain untested.** Both experiment Pods were stopped by approximately 16:05 JST, but two 80GB Pod Volumes remain. Their combined retention estimate is approximately $1.07/day. Cleanup and final Billing reconciliation are still pending. See the [full experiment report](docs/trial-report-2026-10-02.en.md).

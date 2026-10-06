@@ -1,0 +1,17 @@
+{
+  "mode": "offline-mock-only",
+  "live_provider_execution": false,
+  "live_ssh_execution": false,
+  "install_owui_hook": false,
+  "owui_version": "0.11.4",
+  "model_alias": "qwen-27b",
+  "inference_connection": "ephemeral-127.0.0.1-port0-fixture-only",
+  "verified_subject_allowlist": [],
+  "session_grants": [],
+  "signing_key_source": "explicit-in-memory-fixture-injection-only",
+  "durable_journal": "explicit-test-temporary-path-only",
+  "protected_head": "separate-explicit-test-temporary-path-only",
+  "cleanup_policy": "individual-exact-session-pod-export-action-approval",
+  "automatic_terminate": false,
+  "default_environment_or_credential_read": false
+}

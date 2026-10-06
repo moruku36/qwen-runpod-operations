@@ -39,8 +39,9 @@ def gpu_memory_mib() -> dict:
 def load_model(app) -> dict:
     """Start the chat model and time it. This is the load phase, kept out of every request measurement."""
     t0 = time.monotonic()
-    app.manager.ensure("chat")
-    return {"load_s": round(time.monotonic() - t0, 3)}
+    model = app.manager.ensure("chat")
+    return {"load_s": round(time.monotonic() - t0, 3),
+            "effective_ctx": getattr(model, "ctx_size", getattr(getattr(getattr(app, "cfg", None), "chat", None), "ctx_size", 8192)) or 8192}
 
 
 def generate(app, prompt: str, *, max_tokens: int, thinking: bool = False) -> dict:
@@ -76,13 +77,21 @@ def first_response(app, prompt: str = SHORT_PROMPT, max_tokens: int = FIRST_MAX_
     return {"phase": "first", **generate(app, prompt, max_tokens=max_tokens)}
 
 
-def warm_runs(app, prompts: list[str], max_tokens: int = WARM_MAX_TOKENS) -> list[dict]:
+def warm_runs(app, prompts: list[str], max_tokens: int = WARM_MAX_TOKENS, *, on_sample=None, before_sample=None) -> list[dict]:
     """Run only after first_response succeeded. Same cap for every run."""
-    return [{"phase": "warm", **generate(app, p, max_tokens=max_tokens)} for p in prompts]
+    runs = []
+    for p in prompts:
+        if before_sample:
+            before_sample()
+        runs.append({"phase": "warm", **generate(app, p, max_tokens=max_tokens)})
+        if on_sample:
+            on_sample(runs)
+    return runs
 
 
 def summarize(runs: list[dict]) -> dict:
-    ok = [r for r in runs if not r["error"] and r["first_delta_s"] is not None]
+    ok = [r for r in runs if not r["error"] and r["first_delta_s"] is not None
+          and r.get("finish_reason") in ("stop", "length")]
     out = {"runs": len(runs), "ok_runs": len(ok), "errors": sum(1 for r in runs if r["error"])}
     if ok:
         out["first_delta_median_s"] = round(statistics.median(r["first_delta_s"] for r in ok), 3)
@@ -95,7 +104,7 @@ def evaluate_criteria(warm: list[dict]) -> dict:
     """"not_evaluated" unless there are >= 10 successful warm runs capped at 256 tokens. Never pass/fail otherwise."""
     usable = [r for r in warm if r.get("phase") == "warm" and r["max_tokens"] == WARM_MAX_TOKENS]
     s = summarize(usable)
-    if len(usable) < WARM_MIN_RUNS or s["ok_runs"] < WARM_MIN_RUNS:
+    if len(usable) < WARM_MIN_RUNS or s["ok_runs"] < WARM_MIN_RUNS or len(usable) != s["ok_runs"]:
         return {"verdict": "not_evaluated", "reason": f"needs >= {WARM_MIN_RUNS} warm runs at max_tokens={WARM_MAX_TOKENS}"}
     ok = (s["first_delta_median_s"] <= CRITERIA["first_token_median_s"]
           and s["total_median_s"] <= CRITERIA["completion_median_s"])

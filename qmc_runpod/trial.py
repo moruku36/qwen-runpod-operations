@@ -28,7 +28,7 @@ def pod_section(summary: dict | None, price_per_hr: float | None = None) -> dict
 def build_report(*, trial_id: str, repo_root: Path, lock_path: Path, model_records: list[dict], settings: dict,
                  gpu: dict, build: dict, checks: dict, metrics: dict | None = None, timings_s: dict | None = None,
                  server_version: str = "unknown", pod: dict | None = None, notes: list[str] | None = None,
-                 gradio_version: str = "unknown") -> dict:
+                 gradio_version: str = "unknown", capture_runtime: bool = True) -> dict:
     jst = dt.timezone(dt.timedelta(hours=9))
     image = provenance.image_info(podapi.IMAGE)
     rep = {
@@ -41,8 +41,8 @@ def build_report(*, trial_id: str, repo_root: Path, lock_path: Path, model_recor
         "models": [{k: r[k] for k in ("role", "file", "revision", "sha256_verified", "size_bytes")} for r in model_records],
         "environment": {
             "gpu_name": gpu.get("gpu_name", "unknown"), "vram_mib": gpu.get("total_mib", 0),
-            "driver": gpu.get("driver", "unknown"), "cuda_toolkit": provenance.nvcc_release(),
-            "cuda_driver_api": provenance.driver_cuda_version(), "python": platform.python_version(),
+            "driver": gpu.get("driver", "unknown"), "cuda_toolkit": provenance.nvcc_release() if capture_runtime else "not_measured",
+            "cuda_driver_api": provenance.driver_cuda_version() if capture_runtime else "not_measured", "python": platform.python_version(),
             "gradio": gradio_version, **image},
         "settings": settings,
         "checks": checks,

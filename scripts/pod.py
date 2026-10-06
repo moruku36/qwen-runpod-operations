@@ -5,7 +5,7 @@
   create  PAID. Needs --approve LAUNCH-PAID-POD and the --name printed by `plan`. Run only with the owner's go-ahead.
   find    read-only: list pods whose name matches exactly (use after an uncertain create)
   status  read-only summary (allowlisted fields)
-  stop    POST action=stop, then GET until EXITED and cost == 0 (deadline-based). No terminate exists here.
+  stop    POST action=stop, then observe API EXITED. Console/log corroboration and Billing remain pending.
 
 The estimate is an estimate. It is not an automatic stop and not a spending cap.
 """

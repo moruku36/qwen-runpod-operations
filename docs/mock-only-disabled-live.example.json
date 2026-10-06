@@ -1,0 +1,14 @@
+{
+  "example_only_no_runtime_config_loader": true,
+  "constructor": {
+    "backend": "mock",
+    "processing_timeout": 0.5,
+    "stream_fixture": "transport"
+  },
+  "isolated_test_listen_only": {"host": "127.0.0.1", "port": 0},
+  "serve_on_import_or_construction": false,
+  "keep_service_running": false,
+  "live_integrations": {"runpod": false, "open_webui": false, "tunnel": false},
+  "persist_credentials": false,
+  "billing_or_autopay": false
+}

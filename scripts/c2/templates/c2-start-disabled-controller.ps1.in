@@ -1,0 +1,52 @@
+# INERT REVIEW TEMPLATE: regenerate all paths, pins, manifest and ACL proof before deployment.
+function New-C2StopFlagExclusive([string]$Path) {
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {$bytes=[Text.Encoding]::UTF8.GetBytes('stop');$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}
+    finally {$stream.Dispose()}
+}
+
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'c2-path-guard.ps1')
+$deploymentRoot = Get-C2DeploymentRoot
+$runtimeRoot = Join-Path $deploymentRoot 'runtime'
+$pythonPath = '@@REVIEWED_LOCAL_PATH@@'
+Assert-C2PhysicalPath $pythonPath
+$launchLock = [IO.File]::Open((Join-Path $runtimeRoot 'controller-launch.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+try {
+if (@(Get-NetTCPConnection -State Listen -LocalPort 19180 -ErrorAction SilentlyContinue).Count -or @(Get-C2ControllerCandidates).Count) { throw 'Existing listener/controller; no second controller.' }
+$script = Join-Path $runtimeRoot 'c2-disabled-controller.py'
+$manifest = Get-Content -LiteralPath (Join-Path $deploymentRoot 'payload-manifest.json') -Raw | ConvertFrom-Json
+$entry = @($manifest.files | Where-Object {$_.path -ceq 'runtime/c2-disabled-controller.py'})
+if ($entry.Count -ne 1) { throw 'Controller manifest entry missing.' }
+Assert-C2Hash $script $entry[0].sha256
+$recordPath = Join-Path $runtimeRoot 'disabled-controller.json'
+if (Test-Path -LiteralPath $recordPath) { throw 'Controller record collision; explicit review needed.' }
+$stopPath = Join-Path $runtimeRoot 'stop-disabled-controller.flag'
+if (Test-Path -LiteralPath $stopPath) { throw 'Retained stop flag collision; maintenance review required, no deletion.' }
+$process = Start-Process -FilePath $pythonPath -ArgumentList @('-B',$script) -WorkingDirectory $runtimeRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $deploymentRoot 'logs\disabled-controller.stdout.log') -RedirectStandardError (Join-Path $deploymentRoot 'logs\disabled-controller.stderr.log') -PassThru
+try {
+    $limit = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $recordPath)) {
+        $process.Refresh()
+        if ($process.HasExited -or [DateTime]::UtcNow -ge $limit) { throw 'Disabled controller failed to start.' }
+        Start-Sleep -Milliseconds 100
+    }
+    $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    if ($record.pid -ne $process.Id -or $record.deployment_root -cne $deploymentRoot -or $record.mode -cne 'C2_disabled_no_credentials' -or $record.runpod_effects -ne $false -or $record.journal_opened -ne $false -or $record.tunnel_started -ne $false) { throw 'New controller ownership/path mismatch.' }
+    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort 19180 -ErrorAction SilentlyContinue)
+    if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -cne '127.0.0.1' -or $listeners[0].OwningProcess -ne $process.Id) { throw 'New listener ownership mismatch.' }
+    $health = Invoke-WebRequest -Uri 'http://127.0.0.1:19180/healthz' -UseBasicParsing -TimeoutSec 3 -MaximumRedirection 0
+    if ($health.StatusCode -ne 200) { throw 'Disabled health check failed.' }
+    foreach ($route in @('v1/models','status')) {
+        $code = $null
+        try { $response = Invoke-WebRequest -Uri ('http://127.0.0.1:19180/'+$route) -UseBasicParsing -TimeoutSec 3 -MaximumRedirection 0; $code = [int]$response.StatusCode }
+        catch { if ($_.Exception.Response) {$code=[int]$_.Exception.Response.StatusCode} }
+        if ($code -ne 401) { throw 'Disabled authentication gate did not deny.' }
+    }
+    Write-Output ('Disabled controller ready, PID '+$process.Id+'. No credentials/journal/RunPod/SSH loaded.')
+} catch {
+    # Only this invocation's owned child can observe this canonical stop flag.
+    New-C2StopFlagExclusive $stopPath
+    throw
+}
+} finally { $launchLock.Dispose() }

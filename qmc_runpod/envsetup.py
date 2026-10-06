@@ -9,6 +9,7 @@ the workspace, created without system site-packages, installed from the hash-loc
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 from . import layout
@@ -25,7 +26,20 @@ def venv_dir(root: Path | None = None) -> Path:
 
 
 def venv_python(root: Path | None = None) -> Path:
-    return venv_dir(root) / "bin" / "python"
+    return venv_dir(root) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def activation_env(root: Path | None = None, environ: dict | None = None) -> dict[str, str]:
+    """Explicitly activate tools for subprocesses; executing venv Python does not change PATH."""
+    env = dict(os.environ if environ is None else environ)
+    bindir = str(venv_python(root).parent)
+    previous = env.get("PATH", "")
+    env["PATH"] = os.pathsep.join([bindir, *[p for p in previous.split(os.pathsep) if p and p != bindir]])
+    env["VIRTUAL_ENV"] = str(venv_dir(root))
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    return env
 
 
 def create_cmd(root: Path | None = None, python: str | None = None, *, without_pip: bool = False) -> list[str]:
@@ -68,3 +82,25 @@ def is_isolated(root: Path | None = None) -> tuple[bool, str]:
 
 def running_in_venv(root: Path | None = None) -> bool:
     return Path(sys.prefix).resolve() == venv_dir(root).resolve()
+
+
+def kernel_identity_ok(argv0: str, root: Path, *, executable: str | None = None,
+                       prefix: str | None = None, base_prefix: str | None = None) -> bool:
+    """Compare venv identity, never resolved binary identity (Linux venv Python is a symlink)."""
+    lexical = lambda p: os.path.normcase(os.path.abspath(p))
+    intended = lexical(str(venv_python(root)))
+    return (lexical(argv0) == intended and lexical(executable or sys.executable) == intended
+            and Path(prefix or sys.prefix).resolve() == venv_dir(root).resolve()
+            and Path(base_prefix or sys.base_prefix).resolve() != venv_dir(root).resolve())
+
+
+def kernel_verify_cmd(root: Path, kernel_prefix: Path | None = None) -> list[str]:
+    dirs = "kernel_dirs=" + repr([str(kernel_prefix / "share/jupyter/kernels")]) if kernel_prefix else ""
+    script = ("import sys;from pathlib import Path;"
+              f"sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
+              "from qmc_runpod.envsetup import kernel_identity_ok;"
+              "from jupyter_client.kernelspec import KernelSpecManager;"
+              f"s=KernelSpecManager({dirs}).get_kernel_spec({KERNEL_NAME!r});"
+              f"assert kernel_identity_ok(s.argv[0],Path({str(root)!r}));"
+              "print('kernelspec venv and prefix verified')")
+    return [str(venv_python(root)), "-c", script]
