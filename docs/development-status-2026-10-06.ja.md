@@ -50,6 +50,12 @@ PASS。PowerShell 5.1のnative fixtureはmain CAS 15件、hook/排他作成17件
 限定して設定しました。stage済みblobを個人path/identity、literal UUID、秘密/token形式、
 除外artifactについて検査し、一致なしでした。ローカルpytest導入は配布先とのTLS handshakeで
 失敗したため、広いLinux pytest suiteはGitHub CPU CIで確認します。
+公開CIではWindowsのsocket timer競合も検出しました。absolute request budgetの残り時間だけを
+使うsocket待機がmonotonic deadlineの直前に切れると、generic 502になっていました。
+公開transportではこれをrequest deadline 504へ正規化し、明示cancelを優先します。
+retryやbudget延長は追加しません。fake connectionの決定的なregressionで両経路を確認します。
+旧CLIのcredential静的制約を維持し、全packageのambient credential lookupをASTで確認します。
+bridgeの認証は明示的な入力です。
 
 既に行ったA100 80GB／27B GGUF診断はload **347.956秒**、context **8192**、
 1要求・2文字回答に成功し、cleanup/結果回収PASSでした。これはcached診断です。

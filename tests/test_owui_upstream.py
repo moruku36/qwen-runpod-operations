@@ -95,6 +95,27 @@ class OWUIUpstreamTests(unittest.TestCase):
         result = OWUIBinding(controller, upstream); result.bind_ready_session("session-a")
         return result
 
+    def test_socket_budget_timeout_before_clock_deadline_is_normalized_without_retry(self):
+        upstream = LoopbackUpstream(TunnelEndpoint(19181), allow_loopback_io=True)
+        for cancelled, reason in ((False, "request_deadline"), (True, "request_cancelled")):
+            with self.subTest(cancelled=cancelled), \
+                 patch("qmc_runpod.upstream_sse.time.monotonic", return_value=10.0), \
+                 patch("qmc_runpod.upstream_sse.http.client.HTTPConnection") as factory:
+                cancel = threading.Event()
+                connection = factory.return_value
+                def timeout():
+                    if cancelled: cancel.set()
+                    raise TimeoutError("synthetic private timeout details")
+                connection.connect.side_effect = timeout
+                with self.assertRaisesRegex(PrivateChatError, reason) as error:
+                    with upstream._open(body(), "timeout-fixture", 12.0, cancel, lambda: None):
+                        self.fail("Timed-out connection must not yield a reader")
+                self.assertNotIn("private timeout details", str(error.exception))
+                factory.assert_called_once_with("127.0.0.1", 19181, timeout=2.0)
+                connection.connect.assert_called_once()
+                connection.request.assert_not_called()
+                connection.close.assert_called_once()
+
     def consume(self, bridge, *, payload=None, request_id="owui-one", permit=None, timeout=1):
         payload = body() if payload is None else payload
         permit = bridge.permit_interactive(payload, request_id) if permit is None else permit

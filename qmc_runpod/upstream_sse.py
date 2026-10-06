@@ -258,6 +258,13 @@ class LoopbackUpstream:
             yield read
         except PrivateChatError:
             raise
+        except TimeoutError:
+            # Every socket timeout above is the remaining absolute request
+            # budget, not an independent upstream timeout. OS timer rounding can
+            # expire it just before monotonic() reaches deadline; do not turn
+            # that bounded wait into a generic 502 or retry/renew the request.
+            if cancel.is_set(): raise PrivateChatError("request_cancelled") from None
+            raise PrivateChatError("request_deadline") from None
         except (OSError, http.client.HTTPException, UnicodeError, ValueError, TypeError, RecursionError):
             if cancel.is_set(): raise PrivateChatError("request_cancelled") from None
             if time.monotonic() >= deadline: raise PrivateChatError("request_deadline") from None

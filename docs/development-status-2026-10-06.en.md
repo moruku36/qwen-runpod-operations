@@ -64,6 +64,13 @@ The staged public blobs were checked for excluded private artifacts, machine
 paths/identities, literal user UUIDs and secret/token patterns, with no matches.
 Local pytest installation encountered a PyPI distribution-host TLS handshake
 failure; the broader Linux pytest suite is validated by GitHub CPU CI instead.
+Publication CI also exposed a Windows socket timer race: a socket using only the
+remaining absolute request budget could expire just before the monotonic deadline
+and be classified as a generic 502. The public transport now reports that wait as
+request deadline (504), with explicit cancellation taking precedence and no retry
+or budget extension. A deterministic fake-connection regression covers both cases.
+The legacy CLI static credential guard is retained alongside a package-wide AST
+check for ambient credential lookups; injected bridge authentication is explicit.
 
 The already observed A100 80GB / 27B GGUF diagnostic loaded in **347.956 seconds**,
 used context **8192**, completed one request with a two-character answer, and passed
